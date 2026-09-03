@@ -236,8 +236,8 @@ Switching to a tab that the browser discarded to save memory reactivates it, sin
 ## Frames
 
 ```bash
-agent-browser frame "#iframe"     # Switch to iframe by CSS selector
-agent-browser frame @e3           # Switch to iframe by element ref
+agent-browser frame "#iframe"     # Switch by CSS selector in the current frame
+agent-browser frame @e3           # Switch by a ref from the current frame's snapshot
 agent-browser frame main          # Back to main frame
 ```
 
@@ -262,9 +262,15 @@ agent-browser frame main              # Return to main frame
 ```
 
 The `frame` command accepts:
-- **Element refs** — `frame @e3` resolves the ref to an iframe element
+
+- **Element refs** — `frame @e3` and `frame e3` resolve the ref to an iframe element
 - **CSS selectors** — `frame "#payment-iframe"` finds the iframe by selector
-- **Frame name/URL** — matches against the browser's frame tree
+
+Selection is relative to the current frame. After entering one iframe, the next selector is evaluated in that iframe's document, and a ref from a new scoped snapshot resolves in the CDP session that produced it. This works across nested same-process, cross-origin, and out-of-process iframe boundaries. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid.
+
+`eval` and `wait --fn` run in the current frame's page world, so application globals defined by that frame are visible. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
+
+Selection is preserved across short renderer detach/attach transitions when the frame ID remains stable. If the selected frame is removed, frame-scoped commands report `Selected frame is no longer available` rather than falling back to the main document. Run `agent-browser frame main`, then select the desired frame again. Explicit top-document navigation (`open`, `back`, `forward`, `reload`, and `set content`) and successful tab changes reset frame selection to main.
 
 ## Dialogs
 
@@ -442,6 +448,8 @@ agent-browser trace stop trace.json       # Stop and save trace
 agent-browser profiler start              # Start Chrome DevTools profiling
 agent-browser profiler stop trace.json    # Stop and save profile
 ```
+
+Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. OOPIFs in background tabs are not included.
 
 ## React / Web Vitals
 

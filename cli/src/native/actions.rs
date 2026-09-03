@@ -16,7 +16,7 @@ use super::a11y;
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
-use super::cdp::client::CdpClient;
+use super::cdp::client::{cdp_session_matches, CdpClient};
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, CreateTargetResult,
     DispatchMouseEventParams, ExceptionThrownEvent, GetFullAXTreeResult,
@@ -25,7 +25,8 @@ use super::cdp::types::{
 };
 use super::cookies;
 use super::diff;
-use super::element::RefMap;
+use super::element::{RefContext, RefMap};
+use super::frame::{collect_active_frame_topology, FrameContext, SelectedFrame};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -62,6 +63,11 @@ const AUTH_LOGIN_SELECTOR_POLL_INTERVAL_MS: u64 = 100;
 /// Time spent trying targeted username selectors before broad text-input
 /// fallback selectors are allowed.
 const AUTH_LOGIN_PREFERRED_SELECTOR_WINDOW_MS: u64 = 5_000;
+
+/// Time allowed for a detach/attach burst to expose a stable frame ID through
+/// its replacement renderer session.
+const FRAME_RECONCILIATION_GRACE_MS: u64 = 500;
+const FRAME_RECONCILIATION_POLL_MS: u64 = 100;
 
 pub struct PendingConfirmation {
     pub action: String,
@@ -234,6 +240,12 @@ struct DrainedEvents {
     /// while HAR recording; bodies are fetched for these in
     /// `apply_drained_events` before Chrome evicts them (e.g. on navigation).
     har_finished_requests: Vec<(String, Option<String>)>,
+    /// A Page or Target lifecycle event may have changed which renderer
+    /// session owns the selected frame.
+    frame_topology_changed: bool,
+    /// The active top-level document was replaced. Child target roots also
+    /// omit parentId, so this is set only for the active top page session.
+    top_document_navigated: bool,
 }
 
 fn is_active_iframe_network_event(
@@ -247,8 +259,31 @@ fn is_active_iframe_network_event(
         && session_id.is_some_and(|sid| active_iframe_sessions.contains(sid))
 }
 
+fn is_active_iframe_runtime_event(
+    method: &str,
+    session_id: Option<&str>,
+    active_iframe_sessions: &HashSet<String>,
+) -> bool {
+    matches!(
+        method,
+        "Runtime.consoleAPICalled" | "Runtime.exceptionThrown"
+    ) && session_id.is_some_and(|sid| active_iframe_sessions.contains(sid))
+}
+
+fn is_active_iframe_frame_lifecycle_event(
+    method: &str,
+    session_id: Option<&str>,
+    active_iframe_sessions: &HashSet<String>,
+) -> bool {
+    matches!(
+        method,
+        "Page.frameAttached" | "Page.frameNavigated" | "Page.frameDetached"
+    ) && session_id.is_some_and(|sid| active_iframe_sessions.contains(sid))
+}
+
 fn active_frame_scope_may_have_changed(drained: &DrainedEvents) -> bool {
-    !drained.attached_iframe_sessions.is_empty()
+    drained.frame_topology_changed
+        || !drained.attached_iframe_sessions.is_empty()
         || !drained.detached_iframe_sessions.is_empty()
         || !drained.attached_page_sessions.is_empty()
         || !drained.new_targets.is_empty()
@@ -461,7 +496,10 @@ pub struct DaemonState {
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
     pub tracked_requests: Vec<TrackedRequest>,
     pub request_tracking: bool,
-    pub active_frame_id: Option<String>,
+    /// Selected browsing context together with the renderer target session
+    /// that can execute it. Same-process descendants inherit this session
+    /// from their nearest OOPIF or top-level ancestor.
+    pub active_frame: Option<SelectedFrame>,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
     /// Entries are retained across tab changes because Chrome does not emit a
@@ -469,8 +507,8 @@ pub struct DaemonState {
     /// Target.detachedFromTarget events remove stale sessions.
     pub iframe_sessions: HashMap<String, String>,
     /// Dedicated iframe sessions reachable from the currently active page.
-    /// Network tracking uses this subset so background-tab iframe traffic is
-    /// not mixed into the active tab's request list or HAR capture.
+    /// Network and Runtime event tracking use this subset so background-tab
+    /// iframe activity is not mixed into the active tab's diagnostics.
     pub active_iframe_sessions: HashSet<String>,
     /// Origin-scoped extra HTTP headers set via `--headers` on navigate.
     /// Key is the origin (scheme + host + port), value is the headers map.
@@ -601,7 +639,7 @@ impl DaemonState {
             routes: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
             request_tracking: false,
-            active_frame_id: None,
+            active_frame: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
@@ -684,10 +722,24 @@ impl DaemonState {
         s
     }
 
-    fn subscribe_to_browser_events(&mut self) {
-        if let Some(ref browser) = self.browser {
-            self.event_rx = Some(browser.client.subscribe());
+    async fn subscribe_to_browser_events(&mut self) -> Result<(), String> {
+        let Some(ref browser) = self.browser else {
+            return Ok(());
+        };
+        self.event_rx = Some(browser.client.subscribe());
+
+        // Per-page auto-attach is enabled while BrowserManager connects, before
+        // this receiver exists. Recover OOPIF targets that predate the
+        // connection, then feed them through the same setup path as live
+        // Target.attachedToTarget events.
+        let recovered = browser.attach_existing_iframe_targets().await;
+        let mut drained = self.drain_cdp_events();
+        for pair in recovered {
+            if !drained.attached_iframe_sessions.contains(&pair) {
+                drained.attached_iframe_sessions.push(pair);
+            }
         }
+        self.apply_drained_events(drained).await
     }
 
     /// Start the background task that processes Fetch.requestPaused and
@@ -990,7 +1042,25 @@ impl DaemonState {
         self.apply_drained_events(drained).await
     }
 
-    async fn refresh_active_iframe_sessions(&mut self) {
+    fn active_frame_context(&self) -> Result<Option<&FrameContext>, String> {
+        self.active_frame
+            .as_ref()
+            .map(SelectedFrame::context)
+            .transpose()
+    }
+
+    fn reset_top_document_scope(&mut self) {
+        self.ref_map.clear();
+        self.active_iframe_sessions.clear();
+        self.active_frame = None;
+    }
+
+    /// Rebuild the active page's authoritative frame topology. Lifecycle
+    /// reconciliation waits briefly for detach/attach event bursts to settle,
+    /// preserving a selected frame when its stable frame ID moves to a new
+    /// renderer session. A confirmed absence becomes a sticky unavailable
+    /// selection rather than silently falling back to the main document.
+    async fn refresh_active_frame_scope(&mut self, reconcile_selected: bool) {
         let Some(ref browser) = self.browser else {
             self.active_iframe_sessions.clear();
             return;
@@ -999,24 +1069,79 @@ impl DaemonState {
             self.active_iframe_sessions.clear();
             return;
         };
-        if self.iframe_sessions.is_empty() {
-            self.active_iframe_sessions.clear();
-            return;
-        }
-
         let client = browser.client.clone();
         let iframe_sessions = self.iframe_sessions.clone();
-        self.active_iframe_sessions =
-            a11y::active_iframe_session_ids(&client, &top_session_id, &iframe_sessions)
+        let selected = match self.active_frame.as_ref() {
+            Some(SelectedFrame::Available(context)) => Some(context.clone()),
+            Some(SelectedFrame::Unavailable { .. }) | None => None,
+        };
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(FRAME_RECONCILIATION_GRACE_MS);
+        let mut saw_successful_absence = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let topology_result = if reconcile_selected && selected.is_some() {
+                match tokio::time::timeout(
+                    remaining,
+                    collect_active_frame_topology(&client, &top_session_id, &iframe_sessions),
+                )
                 .await
-                .unwrap_or_default();
+                {
+                    Ok(result) => result,
+                    Err(_) => break,
+                }
+            } else {
+                collect_active_frame_topology(&client, &top_session_id, &iframe_sessions).await
+            };
+
+            if let Ok(topology) = topology_result {
+                self.active_iframe_sessions = topology.active_iframe_session_ids(&top_session_id);
+                let Some(selected) = selected.as_ref() else {
+                    return;
+                };
+                if let Some(context) = topology.frame_context(&selected.frame_id) {
+                    self.active_frame = Some(SelectedFrame::Available(context));
+                    return;
+                }
+                saw_successful_absence = true;
+                if !reconcile_selected {
+                    return;
+                }
+            } else if !reconcile_selected || selected.is_none() {
+                return;
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(tokio::time::Duration::from_millis(
+                FRAME_RECONCILIATION_POLL_MS,
+            )))
+            .await;
+        }
+
+        if saw_successful_absence {
+            if let Some(selected) = selected {
+                self.active_frame = Some(SelectedFrame::Unavailable {
+                    frame_id: selected.frame_id,
+                    last_session_id: selected.session_id,
+                });
+            }
+        }
     }
 
     async fn apply_drained_events(&mut self, drained: DrainedEvents) -> Result<(), String> {
         // Popups and externally closed pages can change the active top-level
         // target without changing iframe topology. Refresh after either kind
-        // of event so network capture stays scoped to the active page.
+        // of event so page-wide diagnostics stay scoped to the active page.
         let active_frame_scope_changed = active_frame_scope_may_have_changed(&drained);
+        let active_target_before = self
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.active_target_id().ok())
+            .map(ToString::to_string);
         // ACK screencast frames
         if !drained.pending_acks.is_empty() {
             if let Some(ref browser) = self.browser {
@@ -1362,8 +1487,19 @@ impl DaemonState {
             }
         }
 
+        let active_target_after = self
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.active_target_id().ok())
+            .map(ToString::to_string);
+        let top_scope_replaced = drained.top_document_navigated
+            || (active_target_before.is_some() && active_target_before != active_target_after);
+        if top_scope_replaced {
+            self.reset_top_document_scope();
+        }
+
         if active_frame_scope_changed {
-            self.refresh_active_iframe_sessions().await;
+            self.refresh_active_frame_scope(!top_scope_replaced).await;
         }
 
         Ok(())
@@ -1387,6 +1523,8 @@ impl DaemonState {
         let mut attached_other_sessions: Vec<String> = Vec::new();
         let mut detached_iframe_sessions: Vec<String> = Vec::new();
         let mut har_finished_requests: Vec<(String, Option<String>)> = Vec::new();
+        let mut frame_topology_changed = false;
+        let mut top_document_navigated = false;
 
         loop {
             match rx.try_recv() {
@@ -1518,11 +1656,12 @@ impl DaemonState {
                         _ => {}
                     }
 
-                    let session_matches = if let Some(ref browser) = self.browser {
-                        event.session_id.as_deref() == browser.active_session_id().ok()
-                    } else {
-                        false
-                    };
+                    let active_session_id = self
+                        .browser
+                        .as_ref()
+                        .and_then(|browser| browser.active_session_id().ok());
+                    let session_matches =
+                        cdp_session_matches(active_session_id, event.session_id.as_deref());
 
                     // Allow Network events from cross-origin iframe sessions
                     // when HAR recording or request tracking is active.
@@ -1531,6 +1670,23 @@ impl DaemonState {
                             &event.method,
                             event.session_id.as_deref(),
                             self.har_recording || self.request_tracking,
+                            &self.active_iframe_sessions,
+                        );
+
+                    // Runtime events from same-process frames arrive on the
+                    // top page session. Admit the equivalent events from OOPIF
+                    // sessions that belong to the active page as well.
+                    let iframe_runtime_event = !session_matches
+                        && is_active_iframe_runtime_event(
+                            &event.method,
+                            event.session_id.as_deref(),
+                            &self.active_iframe_sessions,
+                        );
+
+                    let iframe_frame_lifecycle_event = !session_matches
+                        && is_active_iframe_frame_lifecycle_event(
+                            &event.method,
+                            event.session_id.as_deref(),
                             &self.active_iframe_sessions,
                         );
 
@@ -1551,8 +1707,30 @@ impl DaemonState {
                                     || self.iframe_sessions.values().any(|known| known == sid)))
                     });
 
-                    if !session_matches && !iframe_network_event && !webmcp_event {
+                    if !session_matches
+                        && !iframe_network_event
+                        && !iframe_runtime_event
+                        && !iframe_frame_lifecycle_event
+                        && !webmcp_event
+                    {
                         continue;
+                    }
+
+                    if matches!(
+                        event.method.as_str(),
+                        "Page.frameAttached" | "Page.frameNavigated" | "Page.frameDetached"
+                    ) && (session_matches || iframe_frame_lifecycle_event)
+                    {
+                        frame_topology_changed = true;
+                    }
+                    if event.method == "Page.frameNavigated"
+                        && session_matches
+                        && event
+                            .params
+                            .get("frame")
+                            .is_some_and(|frame| frame.get("parentId").is_none())
+                    {
+                        top_document_navigated = true;
                     }
 
                     match event.method.as_str() {
@@ -1931,6 +2109,8 @@ impl DaemonState {
             attached_other_sessions,
             detached_iframe_sessions,
             har_finished_requests,
+            frame_topology_changed,
+            top_document_navigated,
         }
     }
 }
@@ -2392,7 +2572,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     // Keep element resolution in sync with the `frame` selection (see
     // element::set_active_frame for why this is mirrored).
-    super::element::set_active_frame(state.active_frame_id.as_deref());
+    super::element::set_active_frame(state.active_frame.as_ref());
 
     // `--pin-tab` from the client enables strict tab binding even when the
     // daemon was started without the flag, and `--no-pin-tab` (pinTab: false)
@@ -3561,7 +3741,7 @@ async fn auto_launch(
         state.reset_input_state();
         state.browser = Some(mgr);
         state.launch_hash = Some(hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         apply_tab_binding_on_attach_or_rollback(state).await?;
@@ -3604,7 +3784,7 @@ async fn auto_launch(
             }
         }
         state.launch_hash = Some(hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
@@ -3669,7 +3849,7 @@ async fn auto_launch(
                     state.browser = Some(mgr);
                     state.launch_hash = Some(hash);
                     remember_active_provider_session(state, conn.session.clone(), &plugins);
-                    state.subscribe_to_browser_events();
+                    state.subscribe_to_browser_events().await?;
                     state.start_fetch_handler();
                     state.start_dialog_handler();
                     state.update_stream_client().await;
@@ -3734,7 +3914,7 @@ async fn auto_launch(
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
     state.effective_ca_cert = effective_ca_cert;
-    state.subscribe_to_browser_events();
+    state.subscribe_to_browser_events().await?;
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
@@ -4519,7 +4699,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         apply_tab_binding_on_attach_or_rollback(state).await?;
@@ -4536,7 +4716,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         apply_tab_binding_on_attach_or_rollback(state).await?;
@@ -4559,7 +4739,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             }
         }
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
@@ -4627,7 +4807,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                             conn.session.clone(),
                             &command_plugins,
                         );
-                        state.subscribe_to_browser_events();
+                        state.subscribe_to_browser_events().await?;
                         state.start_fetch_handler();
                         state.start_dialog_handler();
                         state.update_stream_client().await;
@@ -4680,7 +4860,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.reset_input_state();
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
     state.launch_hash = Some(new_hash);
-    state.subscribe_to_browser_events();
+    state.subscribe_to_browser_events().await?;
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
@@ -4890,11 +5070,9 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         }
     }
 
-    state.ref_map.clear();
-    state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
     let result = mgr.navigate(url, wait_until).await?;
-    state.refresh_active_iframe_sessions().await;
+    state.reset_top_document_scope();
+    state.refresh_active_frame_scope(false).await;
     Ok(result)
 }
 
@@ -5041,10 +5219,36 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
         .get("script")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'script' parameter")?;
-
-    let result = mgr.evaluate(script, None).await?;
-    let url = mgr.get_url().await.unwrap_or_default();
-    Ok(json!({ "result": result, "origin": url }))
+    let top_session_id = mgr.active_session_id()?.to_string();
+    let active_frame = state.active_frame_context()?;
+    let context =
+        super::element::main_world_execution_context(&mgr.client, &top_session_id, active_frame)?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, script, true, true).await?;
+    if let Some(details) = result.exception_details {
+        let message = details
+            .exception
+            .as_ref()
+            .and_then(|exception| exception.description.as_deref())
+            .unwrap_or(&details.text);
+        return Err(format!("Evaluation error: {}", message));
+    }
+    let value = result.result.value.unwrap_or(Value::Null);
+    // A user expression can navigate its own frame and invalidate `context`
+    // before this best-effort metadata query. Bound the stale-context probe by
+    // the same grace used for the subsequent lifecycle reconciliation instead
+    // of waiting for the CDP client's full command timeout.
+    let origin = tokio::time::timeout(
+        tokio::time::Duration::from_millis(FRAME_RECONCILIATION_GRACE_MS),
+        super::element::evaluate_in_context(&mgr.client, &context, "location.href", true, false),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|result| result.result.value)
+    .and_then(|value| value.as_str().map(ToString::to_string))
+    .unwrap_or_default();
+    Ok(json!({ "result": value, "origin": origin }))
 }
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
@@ -5115,12 +5319,14 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     };
 
     state.ref_map.clear();
+    let active_frame = state.active_frame_context()?.cloned();
     let tree = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
         &mut state.ref_map,
-        state.active_frame_id.as_deref(),
+        active_frame.as_ref().map(|frame| frame.frame_id.as_str()),
+        active_frame.as_ref().map(|frame| frame.session_id.as_str()),
         &state.iframe_sessions,
     )
     .await?;
@@ -5218,6 +5424,7 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
 
     if annotate {
         state.ref_map.clear();
+        let active_frame = state.active_frame_context()?.cloned();
         let _ = snapshot::take_snapshot(
             &mgr.client,
             &session_id,
@@ -5226,7 +5433,8 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
                 ..SnapshotOptions::default()
             },
             &mut state.ref_map,
-            state.active_frame_id.as_deref(),
+            active_frame.as_ref().map(|frame| frame.frame_id.as_str()),
+            active_frame.as_ref().map(|frame| frame.session_id.as_str()),
             &state.iframe_sessions,
         )
         .await?;
@@ -5442,7 +5650,11 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
 async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let top_session_id = mgr.active_session_id()?.to_string();
+    let active_frame = state.active_frame_context()?;
+    let session_id = active_frame
+        .map(|frame| frame.session_id.as_str())
+        .unwrap_or(&top_session_id);
     let key = cmd
         .get("key")
         .and_then(|v| v.as_str())
@@ -5451,7 +5663,7 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     // Parse modifier+key chords like "Control+a", "Shift+Enter", "Control+Shift+a"
     let (actual_key, modifiers) = parse_key_chord(key);
 
-    interaction::press_key_with_modifiers(&mgr.client, &session_id, &actual_key, modifiers).await?;
+    interaction::press_key_with_modifiers(&mgr.client, session_id, &actual_key, modifiers).await?;
     Ok(json!({ "pressed": key }))
 }
 
@@ -5535,16 +5747,30 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
-    interaction::scroll(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        dx,
-        dy,
-        &state.iframe_sessions,
-    )
-    .await?;
+    let active_frame = state.active_frame_context()?;
+    if selector.is_none() && active_frame.is_some() {
+        let context =
+            super::element::frame_execution_context(&mgr.client, &session_id, active_frame).await?;
+        super::element::evaluate_in_context(
+            &mgr.client,
+            &context,
+            &format!("window.scrollBy({}, {})", dx, dy),
+            true,
+            false,
+        )
+        .await?;
+    } else {
+        interaction::scroll(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            dx,
+            dy,
+            &state.iframe_sessions,
+        )
+        .await?;
+    }
     Ok(json!({ "scrolled": true }))
 }
 
@@ -5623,9 +5849,21 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let timeout_ms = state.timeout_ms(cmd);
+    let active_frame = state.active_frame_context()?;
 
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
-        wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
+        let expression = format!(
+            "(document.body.innerText || '').includes({})",
+            serde_json::to_string(text).unwrap_or_default()
+        );
+        poll_until_true_in_frame(
+            &mgr.client,
+            &session_id,
+            active_frame,
+            &expression,
+            timeout_ms,
+        )
+        .await?;
         return Ok(json!({ "waited": "text", "text": text }));
     }
 
@@ -5634,29 +5872,15 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
             .get("state")
             .and_then(|v| v.as_str())
             .unwrap_or("visible");
-        // Honor an active `frame <sel>` selection, like element resolution does.
-        match state.active_frame_id.as_deref() {
-            Some(frame_id) => match state.iframe_sessions.get(frame_id) {
-                Some(frame_session) => {
-                    wait_for_selector(&mgr.client, frame_session, selector, state_str, timeout_ms)
-                        .await?
-                }
-                None => {
-                    wait_for_selector_in_frame(
-                        &mgr.client,
-                        &session_id,
-                        frame_id,
-                        selector,
-                        state_str,
-                        timeout_ms,
-                    )
-                    .await?
-                }
-            },
-            None => {
-                wait_for_selector(&mgr.client, &session_id, selector, state_str, timeout_ms).await?
-            }
-        }
+        wait_for_selector_in_frame(
+            &mgr.client,
+            &session_id,
+            active_frame,
+            selector,
+            state_str,
+            timeout_ms,
+        )
+        .await?;
         return Ok(json!({ "waited": "selector", "selector": selector }));
     }
 
@@ -5666,7 +5890,14 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     }
 
     if let Some(fn_str) = cmd.get("function").and_then(|v| v.as_str()) {
-        wait_for_function(&mgr.client, &session_id, fn_str, timeout_ms).await?;
+        poll_until_true_in_main_world(
+            &mgr.client,
+            &session_id,
+            active_frame,
+            &format!("!!({})", fn_str),
+            timeout_ms,
+        )
+        .await?;
         return Ok(json!({ "waited": "function" }));
     }
 
@@ -5793,7 +6024,7 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
             wb.back().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.reset_top_document_scope();
             return Ok(json!({ "url": url }));
         }
     }
@@ -5801,7 +6032,7 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
     mgr.evaluate("history.back()", None).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.reset_top_document_scope();
     Ok(json!({ "url": url }))
 }
 
@@ -5811,7 +6042,7 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
             wb.forward().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.reset_top_document_scope();
             return Ok(json!({ "url": url }));
         }
     }
@@ -5819,7 +6050,7 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
     mgr.evaluate("history.forward()", None).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.reset_top_document_scope();
     Ok(json!({ "url": url }))
 }
 
@@ -5829,7 +6060,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
             wb.reload().await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
             let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
+            state.reset_top_document_scope();
             return Ok(json!({ "url": url }));
         }
     }
@@ -5846,7 +6077,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
             match rx.recv().await {
                 Ok(event) => {
                     if event.method == "Page.loadEventFired"
-                        && event.session_id.as_deref() == Some(&session_id)
+                        && cdp_session_matches(Some(&session_id), event.session_id.as_deref())
                     {
                         return;
                     }
@@ -5859,7 +6090,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
     .await;
 
     let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    state.reset_top_document_scope();
     Ok(json!({ "url": url }))
 }
 
@@ -5947,61 +6178,121 @@ async fn wait_for_function(
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
 }
 
-/// wait_for_selector inside a same-process iframe selected via `frame <sel>`:
-/// polls through the owner element's contentDocument, which stays correct
-/// even if the frame navigates (the getter re-resolves every poll).
 async fn wait_for_selector_in_frame(
     client: &super::cdp::client::CdpClient,
-    session_id: &str,
-    frame_id: &str,
+    top_session_id: &str,
+    frame: Option<&FrameContext>,
     selector: &str,
     state: &str,
     timeout_ms: u64,
 ) -> Result<(), String> {
-    let owner_object_id =
-        super::element::frame_owner_object_id(client, session_id, frame_id).await?;
     let sel = serde_json::to_string(selector).unwrap_or_default();
-    let check = match state {
-        "attached" => format!("!!doc.querySelector({sel})"),
-        "detached" => format!("!doc.querySelector({sel})"),
+    let expression = match state {
+        "attached" => format!("!!document.querySelector({sel})"),
+        "detached" => format!("!document.querySelector({sel})"),
         "hidden" => format!(
             r#"(() => {{
-                const el = doc.querySelector({sel});
+                const el = document.querySelector({sel});
                 if (!el) return true;
-                const s = doc.defaultView.getComputedStyle(el);
+                const s = window.getComputedStyle(el);
                 return s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0;
             }})()"#,
         ),
         _ => format!(
             r#"(() => {{
-                const el = doc.querySelector({sel});
+                const el = document.querySelector({sel});
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
-                const s = doc.defaultView.getComputedStyle(el);
+                const s = window.getComputedStyle(el);
                 return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
             }})()"#,
         ),
     };
-    let function = format!(
-        "function() {{ const doc = this.contentDocument; if (!doc) return false; return {check}; }}",
-    );
+    poll_until_true_in_frame(client, top_session_id, frame, &expression, timeout_ms).await
+}
+
+async fn poll_until_true_in_frame(
+    client: &super::cdp::client::CdpClient,
+    top_session_id: &str,
+    frame: Option<&FrameContext>,
+    expression: &str,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let context = super::element::frame_execution_context(client, top_session_id, frame).await?;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     loop {
-        let result = client
-            .send_command(
-                "Runtime.callFunctionOn",
-                Some(json!({
-                    "objectId": owner_object_id,
-                    "functionDeclaration": function,
-                    "returnByValue": true,
-                })),
-                Some(session_id),
-            )
-            .await?;
+        let result =
+            super::element::evaluate_in_context(client, &context, expression, true, true).await?;
         let satisfied = result
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_bool())
+            .result
+            .value
+            .as_ref()
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if satisfied {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Wait timed out after {}ms", timeout_ms));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn is_transient_execution_context_error(error: &str) -> bool {
+    error.contains("Cannot find context with specified")
+        || error.contains("Execution context was destroyed")
+        || error.contains("Inspected target navigated or closed")
+}
+
+/// Poll user-authored JavaScript in the document's default world. Resolve the
+/// context again on each pass because navigation replaces default execution
+/// contexts even when the frame ID remains stable.
+async fn poll_until_true_in_main_world(
+    client: &super::cdp::client::CdpClient,
+    top_session_id: &str,
+    frame: Option<&FrameContext>,
+    expression: &str,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    loop {
+        let context =
+            match super::element::main_world_execution_context(client, top_session_id, frame) {
+                Ok(context) => context,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(_) => return Err(format!("Wait timed out after {}ms", timeout_ms)),
+            };
+        let result =
+            match super::element::evaluate_in_context(client, &context, expression, true, true)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) if is_transient_execution_context_error(&error) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(format!("Wait timed out after {}ms", timeout_ms));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        if let Some(details) = result.exception_details {
+            let message = details
+                .exception
+                .as_ref()
+                .and_then(|exception| exception.description.as_deref())
+                .unwrap_or(&details.text);
+            return Err(format!("Evaluation error: {}", message));
+        }
+        let satisfied = result
+            .result
+            .value
+            .as_ref()
+            .and_then(Value::as_bool)
             .unwrap_or(false);
         if satisfied {
             return Ok(());
@@ -6140,7 +6431,7 @@ async fn handle_storage_clear(cmd: &Value, state: &DaemonState) -> Result<Value,
     Ok(json!({ "cleared": true }))
 }
 
-async fn handle_setcontent(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_setcontent(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let html = cmd
@@ -6148,6 +6439,7 @@ async fn handle_setcontent(cmd: &Value, state: &DaemonState) -> Result<Value, St
         .and_then(|v| v.as_str())
         .ok_or("Missing 'html' parameter")?;
     network::set_content(&mgr.client, &session_id, html).await?;
+    state.reset_top_document_scope();
     Ok(json!({ "set": true }))
 }
 
@@ -6285,12 +6577,14 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
     // Start from the same ref base as a normal baseline snapshot so unchanged lines align.
     // Build the replacement separately so a failed diff leaves the existing refs usable.
     let mut current_ref_map = RefMap::new();
+    let active_frame = state.active_frame_context()?.cloned();
     let current = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
         &mut current_ref_map,
-        state.active_frame_id.as_deref(),
+        active_frame.as_ref().map(|frame| frame.frame_id.as_str()),
+        active_frame.as_ref().map(|frame| frame.session_id.as_str()),
         &state.iframe_sessions,
     )
     .await?;
@@ -6357,6 +6651,7 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &options,
         &mut snap1_ref_map,
         None,
+        None,
         &state.iframe_sessions,
     )
     .await?;
@@ -6370,6 +6665,7 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &session_id,
         &options,
         &mut snap2_ref_map,
+        None,
         None,
         &state.iframe_sessions,
     )
@@ -6536,15 +6832,13 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     let defer_url_until_controls =
         should_defer_url_until_network_controls(domain_filter.as_ref(), has_proxy_creds, url)?;
 
-    state.ref_map.clear();
-    state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
-    state.webmcp.clear_invocations();
     let mut result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         mgr.tab_new(if defer_url_until_controls { None } else { url }, label)
             .await?
     };
+    state.reset_top_document_scope();
+    state.webmcp.clear_invocations();
 
     install_network_controls_or_close(state, has_proxy_creds).await?;
     state.drain_cdp_events_background().await?;
@@ -6566,7 +6860,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         }
     }
 
-    state.refresh_active_iframe_sessions().await;
+    state.refresh_active_frame_scope(false).await;
 
     Ok(result)
 }
@@ -6592,14 +6886,12 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     };
     // Clear only after the switch commits, so a failed switch does not strand
     // the user on the old tab with dead refs and frame scope.
-    state.ref_map.clear();
-    state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
+    state.reset_top_document_scope();
     state.webmcp.clear_invocations();
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     install_network_controls_or_close(state, has_proxy_creds).await?;
-    state.refresh_active_iframe_sessions().await;
+    state.refresh_active_frame_scope(false).await;
 
     // A dialog-blocked tab's renderer is paused and cannot answer an eval, so
     // skip the viewport sync; it would otherwise stall on the CDP timeout. The
@@ -6650,11 +6942,9 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     };
     // Clear only after the close commits; a rejected close (last tab, bad
     // index) must not wipe the caller's refs and frame scope.
-    state.ref_map.clear();
-    state.active_iframe_sessions.clear();
+    state.reset_top_document_scope();
     state.webmcp.clear_invocations();
-    state.active_frame_id = None;
-    state.refresh_active_iframe_sessions().await;
+    state.refresh_active_frame_scope(false).await;
     Ok(result)
 }
 
@@ -8277,7 +8567,7 @@ async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Va
     state.stream_client = Some(client_slot);
     state.stream_server = Some(Arc::new(server));
     state.request_tracking = true;
-    state.refresh_active_iframe_sessions().await;
+    state.refresh_active_frame_scope(false).await;
     if state.screencasting {
         if let Some(ref server) = state.stream_server {
             server.set_screencasting(true).await;
@@ -8679,21 +8969,27 @@ async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Valu
         .and_then(|v| v.as_str())
         .ok_or("Missing 'expression' parameter")?;
     let timeout_ms = state.timeout_ms(cmd);
+    let active_frame = state.active_frame_context()?;
 
-    wait_for_function(&mgr.client, &session_id, expression, timeout_ms).await?;
+    poll_until_true_in_main_world(
+        &mgr.client,
+        &session_id,
+        active_frame,
+        &format!("!!({})", expression),
+        timeout_ms,
+    )
+    .await?;
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: format!("({})", expression),
-                return_by_value: Some(true),
-                await_promise: Some(true),
-            },
-            Some(&session_id),
-        )
-        .await?;
+    let context =
+        super::element::main_world_execution_context(&mgr.client, &session_id, active_frame)?;
+    let result = super::element::evaluate_in_context(
+        &mgr.client,
+        &context,
+        &format!("({})", expression),
+        true,
+        true,
+    )
+    .await?;
 
     Ok(json!({ "result": result.result.value.unwrap_or(Value::Null) }))
 }
@@ -8702,9 +8998,62 @@ async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Valu
 // Frame handlers
 // ---------------------------------------------------------------------------
 
+fn selected_frame_from_node(
+    describe: &Value,
+    source_session_id: &str,
+    iframe_sessions: &HashMap<String, String>,
+    fallback_label: &str,
+) -> Result<(FrameContext, String), String> {
+    let node = describe
+        .get("node")
+        .ok_or("Could not resolve iframe element")?;
+    let node_name = node.get("nodeName").and_then(Value::as_str).unwrap_or("");
+    if node_name != "IFRAME" && node_name != "FRAME" {
+        return Err("Selected element is not an iframe".to_string());
+    }
+
+    let frame_id = node
+        .get("contentDocument")
+        .and_then(|document| document.get("frameId"))
+        .and_then(Value::as_str)
+        .or_else(|| node.get("frameId").and_then(Value::as_str))
+        .ok_or("Could not resolve frame ID for iframe element")?;
+    let session_id = iframe_sessions
+        .get(frame_id)
+        .cloned()
+        .unwrap_or_else(|| source_session_id.to_string());
+
+    let attributes = node
+        .get("attributes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let attribute = |name: &str| {
+        attributes
+            .iter()
+            .enumerate()
+            .find(|(_, value)| value.as_str() == Some(name))
+            .and_then(|(index, _)| attributes.get(index + 1))
+            .and_then(Value::as_str)
+    };
+    let label = attribute("name")
+        .or_else(|| attribute("id"))
+        .or_else(|| attribute("title"))
+        .unwrap_or(fallback_label)
+        .to_string();
+
+    Ok((
+        FrameContext {
+            frame_id: frame_id.to_string(),
+            session_id,
+        },
+        label,
+    ))
+}
+
 async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let top_session_id = mgr.active_session_id()?.to_string();
 
     let selector = cmd.get("selector").and_then(|v| v.as_str());
     let name = cmd.get("name").and_then(|v| v.as_str());
@@ -8713,11 +9062,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     if selector.is_none() && name.is_none() && url.is_none() {
         return Err("At least one of 'selector', 'name', or 'url' is required".to_string());
     }
-
-    let tree_result = mgr
-        .client
-        .send_command_no_params("Page.getFrameTree", Some(&session_id))
-        .await?;
+    let active_frame = state.active_frame_context()?.cloned();
 
     fn find_frame(tree: &Value, name: Option<&str>, url: Option<&str>) -> Option<String> {
         let frame = tree.get("frame")?;
@@ -8746,9 +9091,6 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         None
     }
 
-    let frame_tree = &tree_result["frameTree"];
-
-    // If selector is a ref (@e1), resolve the iframe element from the ref map
     if let Some(sel) = selector {
         if let Some(ref_id) = super::element::parse_ref(sel) {
             let entry = state
@@ -8758,93 +9100,119 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             let backend_node_id = entry
                 .backend_node_id
                 .ok_or_else(|| format!("Ref {} has no backend node id", ref_id))?;
-
-            // Use DOM.describeNode to resolve the child frame ID directly.
-            // This works reliably for all iframes, including those without
-            // name, id, or src attributes.
+            let source_session_id = entry
+                .session_id
+                .clone()
+                .or_else(|| {
+                    entry
+                        .frame_id
+                        .as_ref()
+                        .and_then(|frame_id| state.iframe_sessions.get(frame_id).cloned())
+                })
+                .unwrap_or_else(|| top_session_id.clone());
             let describe: Value = mgr
                 .client
                 .send_command(
                     "DOM.describeNode",
                     Some(json!({ "backendNodeId": backend_node_id, "depth": 1 })),
-                    Some(&session_id),
+                    Some(&source_session_id),
                 )
                 .await?;
-
-            // Verify this is an iframe/frame element
-            let node_name = describe
-                .get("node")
-                .and_then(|n| n.get("nodeName"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if node_name != "IFRAME" && node_name != "FRAME" {
-                return Err("Ref does not point to an iframe element".to_string());
-            }
-
-            // Try contentDocument.frameId first (standard for iframes)
-            let frame_id = describe
-                .get("node")
-                .and_then(|n| n.get("contentDocument"))
-                .and_then(|cd| cd.get("frameId"))
-                .and_then(|v| v.as_str())
-                // Fallback: the node itself may carry a frameId
-                .or_else(|| {
-                    describe
-                        .get("node")
-                        .and_then(|n| n.get("frameId"))
-                        .and_then(|v| v.as_str())
-                })
-                .ok_or("Could not resolve frame ID for iframe element")?;
-
-            let label = describe
-                .get("node")
-                .and_then(|n| n.get("attributes"))
-                .and_then(|a| a.as_array())
-                .and_then(|attrs| {
-                    attrs
-                        .iter()
-                        .enumerate()
-                        .find(|(_, v)| v.as_str() == Some("name"))
-                        .and_then(|(i, _)| attrs.get(i + 1))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or(&ref_id);
-
-            state.active_frame_id = Some(frame_id.to_string());
+            let (frame, label) = selected_frame_from_node(
+                &describe,
+                &source_session_id,
+                &state.iframe_sessions,
+                &ref_id,
+            )?;
+            state.active_frame = Some(SelectedFrame::Available(frame));
             return Ok(json!({ "frame": label }));
         }
 
-        // CSS selector path
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector({});
-                if (!el) return null;
-                if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {{
-                    return el.name || el.id || el.src || null;
-                }}
-                return null;
-            }})()"#,
+        let expression = format!(
+            "document.querySelector({})",
             serde_json::to_string(sel).unwrap_or_default()
         );
-        let result = mgr.evaluate(&js, None).await?;
-        let frame_name = result.as_str().ok_or("Could not find frame for selector")?;
-        if let Some(frame_id) = find_frame(frame_tree, Some(frame_name), None) {
-            state.active_frame_id = Some(frame_id);
-            return Ok(json!({ "frame": frame_name }));
+        let execution_context = super::element::frame_execution_context(
+            &mgr.client,
+            &top_session_id,
+            active_frame.as_ref(),
+        )
+        .await?;
+        let result = super::element::evaluate_in_context(
+            &mgr.client,
+            &execution_context,
+            &expression,
+            false,
+            false,
+        )
+        .await?;
+        if let Some(details) = result.exception_details {
+            let message = details
+                .exception
+                .as_ref()
+                .and_then(|exception| exception.description.as_deref())
+                .unwrap_or(&details.text);
+            return Err(format!("Invalid frame selector '{}': {}", sel, message));
         }
+        let object_id = result
+            .result
+            .object_id
+            .ok_or("Could not find frame for selector")?;
+        let describe = mgr
+            .client
+            .send_command(
+                "DOM.describeNode",
+                Some(json!({ "objectId": object_id, "depth": 1 })),
+                Some(&execution_context.session_id),
+            )
+            .await?;
+        let (frame, label) = selected_frame_from_node(
+            &describe,
+            &execution_context.session_id,
+            &state.iframe_sessions,
+            sel,
+        )?;
+        state.active_frame = Some(SelectedFrame::Available(frame));
+        return Ok(json!({ "frame": label }));
     }
 
-    if let Some(frame_id) = find_frame(frame_tree, name, url) {
-        let label = name.or(url).unwrap_or("frame");
-        state.active_frame_id = Some(frame_id);
-        return Ok(json!({ "frame": label }));
+    // Legacy daemon callers can select by frame name or URL. Search attached
+    // iframe targets before the top target because their trees are the
+    // authoritative source for same-process descendants below an OOPIF.
+    let mut sessions = state
+        .active_iframe_sessions
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    sessions.push(top_session_id.clone());
+    for source_session_id in sessions {
+        let Ok(tree_result) = mgr
+            .client
+            .send_command_no_params("Page.getFrameTree", Some(&source_session_id))
+            .await
+        else {
+            continue;
+        };
+        if let Some(frame_id) = find_frame(&tree_result["frameTree"], name, url) {
+            let session_id = state
+                .iframe_sessions
+                .get(&frame_id)
+                .cloned()
+                .unwrap_or(source_session_id);
+            state.active_frame = Some(SelectedFrame::Available(FrameContext {
+                frame_id,
+                session_id,
+            }));
+            return Ok(json!({ "frame": name.or(url).unwrap_or("frame") }));
+        }
     }
 
     Err("Frame not found".to_string())
 }
 
 async fn handle_mainframe(state: &mut DaemonState) -> Result<Value, String> {
-    state.active_frame_id = None;
+    state.active_frame = None;
     Ok(json!({ "frame": "main" }))
 }
 
@@ -9090,17 +9458,11 @@ async fn handle_presentational_getbyrole(
         }}"#
     );
 
+    let active_frame = state.active_frame_context()?.cloned();
     let located = {
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
         let top_session = mgr.active_session_id()?.to_string();
-        eval_body_in_active_frame(
-            mgr,
-            state.active_frame_id.as_deref(),
-            &top_session,
-            &state.iframe_sessions,
-            &locate_body,
-        )
-        .await?
+        eval_body_in_active_frame(mgr, &top_session, active_frame.as_ref(), &locate_body).await?
     };
 
     if !located.as_bool().unwrap_or(false) {
@@ -9119,9 +9481,8 @@ async fn handle_presentational_getbyrole(
             let top_session = top_session.to_string();
             let _ = eval_body_in_active_frame(
                 mgr,
-                state.active_frame_id.as_deref(),
                 &top_session,
-                &state.iframe_sessions,
+                active_frame.as_ref(),
                 "(root) => { root.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located'); }",
             )
             .await;
@@ -9132,62 +9493,23 @@ async fn handle_presentational_getbyrole(
 }
 
 /// Evaluate a `(root) => {...}` body against the active frame's document, or the
-/// top document when no frame is selected. Runtime.evaluate cannot target a
-/// same-origin child frame, so that case runs the body against the frame owner's
-/// contentDocument (as element resolution does); an OOPIF has its own session
-/// where `document` is already the frame document.
+/// top document when no frame is selected.
 async fn eval_body_in_active_frame(
     mgr: &BrowserManager,
-    frame_id: Option<&str>,
     top_session: &str,
-    iframe_sessions: &HashMap<String, String>,
+    frame: Option<&FrameContext>,
     body: &str,
 ) -> Result<Value, String> {
-    match frame_id {
-        Some(fid) if !iframe_sessions.contains_key(fid) => {
-            let owner =
-                super::element::frame_owner_object_id(&mgr.client, top_session, fid).await?;
-            let func = format!(
-                "function() {{ const d = this.contentDocument; if (!d) return null; return ({body})(d); }}"
-            );
-            let res = mgr
-                .client
-                .send_command(
-                    "Runtime.callFunctionOn",
-                    Some(serde_json::json!({
-                        "objectId": owner,
-                        "functionDeclaration": func,
-                        "returnByValue": true,
-                    })),
-                    Some(top_session),
-                )
-                .await?;
-            Ok(res
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .cloned()
-                .unwrap_or(Value::Null))
-        }
-        _ => {
-            let session = frame_id
-                .and_then(|f| iframe_sessions.get(f))
-                .map(|s| s.as_str())
-                .unwrap_or(top_session);
-            let res: super::cdp::types::EvaluateResult = mgr
-                .client
-                .send_command_typed(
-                    "Runtime.evaluate",
-                    &super::cdp::types::EvaluateParams {
-                        expression: format!("({body})(document)"),
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session),
-                )
-                .await?;
-            Ok(res.result.value.unwrap_or(Value::Null))
-        }
-    }
+    let context = super::element::frame_execution_context(&mgr.client, top_session, frame).await?;
+    let result = super::element::evaluate_in_context(
+        &mgr.client,
+        &context,
+        &format!("({body})(document)"),
+        true,
+        false,
+    )
+    .await?;
+    Ok(result.result.value.unwrap_or(Value::Null))
 }
 
 async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -9206,12 +9528,14 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     if is_presentational_role(role) || role.eq_ignore_ascii_case("directory") {
         return handle_presentational_getbyrole(cmd, state, role, name, exact).await;
     }
+    let active_frame = state.active_frame_context()?.cloned();
 
     // Query the accessibility tree via CDP: the browser engine is the
     // authoritative source for implicit roles (e.g. <h2> -> "heading",
     // <a href> -> "link"), which a CSS selector cannot approximate.
     let (ax_params, effective_session_id) = super::element::resolve_ax_session(
-        state.active_frame_id.as_deref(),
+        active_frame.as_ref().map(|frame| frame.frame_id.as_str()),
+        active_frame.as_ref().map(|frame| frame.session_id.as_str()),
         &session_id,
         &state.iframe_sessions,
     );
@@ -9235,7 +9559,10 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         role,
         &actual_name,
         None,
-        state.active_frame_id.as_deref(),
+        RefContext {
+            frame_id: active_frame.as_ref().map(|frame| frame.frame_id.as_str()),
+            session_id: Some(effective_session_id),
+        },
     );
     state.ref_map.set_next_ref_num(ref_num + 1);
 
@@ -9478,18 +9805,12 @@ async fn handle_semantic_locator(
         }
     };
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: query,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&session_id),
-        )
-        .await?;
+    let active_frame = state.active_frame_context()?.cloned();
+    let context =
+        super::element::frame_execution_context(&mgr.client, &session_id, active_frame.as_ref())
+            .await?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, &query, true, false).await?;
 
     if !result
         .result
@@ -9505,12 +9826,14 @@ async fn handle_semantic_locator(
     let action_result = execute_subaction(cmd, state, selector).await;
 
     if let Some(ref browser) = state.browser {
-        let _ = browser
-            .evaluate(
-                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
-                None,
-            )
-            .await;
+        let _ = super::element::evaluate_in_context(
+            &browser.client,
+            &context,
+            "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+            true,
+            false,
+        )
+        .await;
     }
 
     action_result
@@ -9564,18 +9887,12 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
         idx = index,
     );
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: js,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&session_id),
-        )
-        .await?;
+    let active_frame = state.active_frame_context()?.cloned();
+    let context =
+        super::element::frame_execution_context(&mgr.client, &session_id, active_frame.as_ref())
+            .await?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, &js, true, false).await?;
 
     if !result
         .result
@@ -9594,12 +9911,14 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     let action_result = execute_subaction(cmd, state, located).await;
 
     if let Some(ref browser) = state.browser {
-        let _ = browser
-            .evaluate(
-                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
-                None,
-            )
-            .await;
+        let _ = super::element::evaluate_in_context(
+            &browser.client,
+            &context,
+            "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+            true,
+            false,
+        )
+        .await;
     }
 
     action_result
@@ -9607,6 +9926,7 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
 
 async fn handle_find(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -9625,8 +9945,15 @@ async fn handle_find(cmd: &Value, state: &DaemonState) -> Result<Value, String> 
         serde_json::to_string(selector).unwrap_or_default()
     );
 
-    let result = mgr.evaluate(&js, None).await?;
-    Ok(json!({ "elements": result, "selector": selector }))
+    let active_frame = state.active_frame_context()?;
+    let context =
+        super::element::frame_execution_context(&mgr.client, &session_id, active_frame).await?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, &js, true, false).await?;
+    Ok(json!({
+        "elements": result.result.value.unwrap_or(Value::Null),
+        "selector": selector
+    }))
 }
 
 async fn handle_evalhandle(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -10117,7 +10444,7 @@ async fn handle_har_start(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         Some(s) => HarContentMode::parse(s)?,
         None => HarContentMode::default(),
     };
-    state.refresh_active_iframe_sessions().await;
+    state.refresh_active_frame_scope(false).await;
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     // Larger buffers so response bodies survive until the periodic event
@@ -10965,7 +11292,7 @@ async fn handle_requests(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     if !state.request_tracking {
         state.request_tracking = true;
-        state.refresh_active_iframe_sessions().await;
+        state.refresh_active_frame_scope(false).await;
         if let Some(ref mgr) = state.browser {
             if let Ok(session_id) = mgr.active_session_id() {
                 let _ = mgr
@@ -12513,6 +12840,89 @@ mod tests {
     }
 
     #[test]
+    fn test_iframe_runtime_events_are_scoped_to_active_page_sessions() {
+        let active_sessions = HashSet::from(["active-iframe".to_string()]);
+
+        for method in ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"] {
+            assert!(is_active_iframe_runtime_event(
+                method,
+                Some("active-iframe"),
+                &active_sessions,
+            ));
+            assert!(!is_active_iframe_runtime_event(
+                method,
+                Some("background-iframe"),
+                &active_sessions,
+            ));
+            assert!(!is_active_iframe_runtime_event(
+                method,
+                None,
+                &active_sessions,
+            ));
+        }
+        assert!(!is_active_iframe_runtime_event(
+            "Network.requestWillBeSent",
+            Some("active-iframe"),
+            &active_sessions,
+        ));
+    }
+
+    #[test]
+    fn test_frame_lifecycle_events_are_scoped_and_direct_page_sessions_match() {
+        let active_sessions = HashSet::from(["active-iframe".to_string()]);
+
+        for method in [
+            "Page.frameAttached",
+            "Page.frameNavigated",
+            "Page.frameDetached",
+        ] {
+            assert!(is_active_iframe_frame_lifecycle_event(
+                method,
+                Some("active-iframe"),
+                &active_sessions,
+            ));
+            assert!(!is_active_iframe_frame_lifecycle_event(
+                method,
+                Some("background-iframe"),
+                &active_sessions,
+            ));
+        }
+
+        assert!(cdp_session_matches(Some(""), None));
+        assert!(cdp_session_matches(Some(""), Some("")));
+        assert!(cdp_session_matches(
+            Some("page-session"),
+            Some("page-session")
+        ));
+        assert!(!cdp_session_matches(Some("page-session"), None));
+    }
+
+    #[test]
+    fn test_unavailable_frame_is_sticky_until_top_scope_reset() {
+        let mut state = DaemonState::new();
+        state.active_frame = Some(SelectedFrame::Unavailable {
+            frame_id: "removed-frame".to_string(),
+            last_session_id: "old-session".to_string(),
+        });
+        state
+            .active_iframe_sessions
+            .insert("old-session".to_string());
+        state
+            .ref_map
+            .add("e1".to_string(), Some(1), "button", "stale", None);
+
+        assert_eq!(
+            state.active_frame_context().unwrap_err(),
+            super::super::frame::SELECTED_FRAME_UNAVAILABLE
+        );
+
+        state.reset_top_document_scope();
+        assert!(state.active_frame_context().unwrap().is_none());
+        assert!(state.active_iframe_sessions.is_empty());
+        assert!(state.ref_map.get("e1").is_none());
+    }
+
+    #[test]
     fn test_active_frame_scope_tracks_top_level_and_iframe_changes() {
         assert!(!active_frame_scope_may_have_changed(
             &DrainedEvents::default()
@@ -12529,6 +12939,12 @@ mod tests {
             .attached_iframe_sessions
             .push(("frame".to_string(), "session".to_string()));
         assert!(active_frame_scope_may_have_changed(&attached_iframe));
+
+        let lifecycle = DrainedEvents {
+            frame_topology_changed: true,
+            ..DrainedEvents::default()
+        };
+        assert!(active_frame_scope_may_have_changed(&lifecycle));
     }
 
     #[test]

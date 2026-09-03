@@ -4297,6 +4297,17 @@ mod tests {
         assert_eq!(cmd["action"], "mainframe");
     }
 
+    #[test]
+    fn test_frame_accepts_prefixed_and_bare_refs() {
+        let prefixed = parse_command(&args("frame @e3"), &default_flags()).unwrap();
+        assert_eq!(prefixed["action"], "frame");
+        assert_eq!(prefixed["selector"], "@e3");
+
+        let bare = parse_command(&args("frame e3"), &default_flags()).unwrap();
+        assert_eq!(bare["action"], "frame");
+        assert_eq!(bare["selector"], "e3");
+    }
+
     // === Tabs ===
 
     #[test]

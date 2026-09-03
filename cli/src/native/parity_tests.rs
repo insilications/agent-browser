@@ -8,6 +8,7 @@
 use serde_json::{json, Value};
 
 use super::actions::{execute_command, DaemonState};
+use super::frame::{FrameContext, SelectedFrame};
 
 const ENCRYPTION_KEY_ENV: &str = "AGENT_BROWSER_ENCRYPTION_KEY";
 
@@ -555,7 +556,7 @@ async fn test_daemon_state_new_defaults() {
     assert!(state.pending_confirmation.is_none());
     assert!(!state.request_tracking);
     assert!(state.tracked_requests.is_empty());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
     assert!(state.iframe_sessions.is_empty());
     assert!(state.active_iframe_sessions.is_empty());
     assert!(state.webdriver_backend.is_none());
@@ -679,15 +680,28 @@ async fn test_addscript_and_addinitscript_separate_dispatch() {
 #[tokio::test]
 async fn test_frame_context_management() {
     let mut state = DaemonState::new();
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
 
     // Set a frame ID and verify it persists
-    state.active_frame_id = Some("child-frame-123".to_string());
-    assert_eq!(state.active_frame_id.as_deref(), Some("child-frame-123"));
+    state.active_frame = Some(SelectedFrame::Available(FrameContext {
+        frame_id: "child-frame-123".to_string(),
+        session_id: "child-session-123".to_string(),
+    }));
+    assert_eq!(
+        state.active_frame.as_ref().map(SelectedFrame::frame_id),
+        Some("child-frame-123")
+    );
+    assert_eq!(
+        state
+            .active_frame
+            .as_ref()
+            .map(SelectedFrame::last_session_id),
+        Some("child-session-123")
+    );
 
     // Clearing the frame ID (what mainframe does)
-    state.active_frame_id = None;
-    assert!(state.active_frame_id.is_none());
+    state.active_frame = None;
+    assert!(state.active_frame.is_none());
 }
 
 #[tokio::test]

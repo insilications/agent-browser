@@ -230,8 +230,8 @@ agent-browser tab new --label docs [url]       # New tab with a user-assigned la
 agent-browser tab <t<N>|label>                 # Switch to a tab by id or label
 agent-browser tab close [t<N>|label]           # Close a tab (defaults to active)
 agent-browser window new                       # Open new browser window
-agent-browser frame <sel>                      # Switch to iframe by CSS selector
-agent-browser frame @e3                        # Switch to iframe by element ref
+agent-browser frame <sel>                      # Switch by CSS selector in the current frame
+agent-browser frame @e3                        # Switch by a ref from the current frame's snapshot
 agent-browser frame main                       # Back to main frame
 ```
 
@@ -285,7 +285,11 @@ agent-browser snapshot -i             # Only elements inside that iframe
 agent-browser frame main              # Return to main frame
 ```
 
-The `frame` command accepts element refs (`@e3`), CSS selectors (`"#my-iframe"`), or frame name/URL.
+The `frame` command accepts element refs (`@e3` or `e3`) and CSS selectors (`"#my-iframe"`). Selection is relative to the current frame, so after entering one iframe the next selector is evaluated in that iframe's document. A ref from a new scoped snapshot is resolved in the CDP session that produced it, including for nested same-process, cross-origin, and out-of-process iframes. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid.
+
+`eval` and `wait --fn` run in the current frame's page world, so application globals defined by that document are visible. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
+
+Selection is preserved across short renderer detach/attach transitions when the frame ID stays stable. If the selected frame is removed, frame-scoped commands report `Selected frame is no longer available` instead of falling back to the main document. Run `agent-browser frame main`, then select the desired frame again. Explicit top-document navigation (`open`, `back`, `forward`, `reload`, and `set content`) and successful tab changes reset frame selection to main.
 
 ## Dialogs
 
@@ -330,6 +334,8 @@ agent-browser errors --clear          # Clear error log
 agent-browser highlight <sel>         # Highlight element
 agent-browser inspect                 # Open Chrome DevTools for the active page
 ```
+
+Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. OOPIFs belonging to background tabs remain excluded.
 
 See [Debugging](/debugging) for console, error, dialog, trace, highlight, and DevTools workflows. See [Video Recording](/recording) for `record` workflows and [Profiler](/profiler) for performance profiles.
 

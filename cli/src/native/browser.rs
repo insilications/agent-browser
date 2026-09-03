@@ -808,6 +808,51 @@ impl BrowserManager {
         Ok(())
     }
 
+    /// Attach iframe targets that already existed when this CDP connection was
+    /// established. `enable_domains` installs per-page auto-attach before the
+    /// daemon subscribes to events, so those initial attachment events cannot
+    /// populate its frame-to-session map. Explicit flattened attachments give
+    /// the daemon sessions it can retain alongside subsequently auto-attached
+    /// iframe targets.
+    pub async fn attach_existing_iframe_targets(&self) -> Vec<(String, String)> {
+        if self.direct_page {
+            return Vec::new();
+        }
+
+        let Ok(result) = self
+            .client
+            .send_command_typed::<_, GetTargetsResult>("Target.getTargets", &json!({}), None)
+            .await
+        else {
+            return Vec::new();
+        };
+
+        let mut sessions = Vec::new();
+        for target in result
+            .target_infos
+            .into_iter()
+            .filter(|target| target.target_type == "iframe")
+        {
+            let Ok(attached) = self
+                .client
+                .send_command_typed::<_, AttachToTargetResult>(
+                    "Target.attachToTarget",
+                    &AttachToTargetParams {
+                        target_id: target.target_id.clone(),
+                        flatten: true,
+                    },
+                    None,
+                )
+                .await
+            else {
+                // A target can disappear between discovery and attachment.
+                continue;
+            };
+            sessions.push((target.target_id, attached.session_id));
+        }
+        sessions
+    }
+
     async fn enable_domains(&self, session_id: &str) -> Result<(), String> {
         self.prepare_domains(session_id).await?;
         self.resume_if_waiting(session_id).await?;
@@ -3031,6 +3076,87 @@ mod tests {
             bound_target_gone: None,
             headless: true,
         }
+    }
+
+    #[tokio::test]
+    async fn test_attach_existing_iframe_targets_recovers_dedicated_sessions() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(Message::Text(text))) = rx.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let id = command["id"].as_u64().unwrap();
+                let result = match command["method"].as_str().unwrap_or("") {
+                    "Target.getTargets" => json!({
+                        "targetInfos": [
+                            {
+                                "targetId": "page-target",
+                                "type": "page",
+                                "title": "page",
+                                "url": "https://page.test/"
+                            },
+                            {
+                                "targetId": "iframe-a",
+                                "type": "iframe",
+                                "title": "frame a",
+                                "url": "https://a.test/"
+                            },
+                            {
+                                "targetId": "iframe-b",
+                                "type": "iframe",
+                                "title": "frame b",
+                                "url": "https://b.test/"
+                            }
+                        ]
+                    }),
+                    "Target.attachToTarget" => {
+                        let target_id = command["params"]["targetId"].as_str().unwrap();
+                        json!({ "sessionId": format!("session-{target_id}") })
+                    }
+                    _ => json!({}),
+                };
+                tx.send(Message::Text(
+                    json!({ "id": id, "result": result }).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        let client = Arc::new(CdpClient::connect(&ws_url).await.unwrap());
+        let manager = BrowserManager {
+            client,
+            browser_process: None,
+            ws_url,
+            pages: Vec::new(),
+            active_page_index: 0,
+            default_timeout_ms: 25_000,
+            download_path: None,
+            ignore_https_errors: false,
+            visited_origins: HashSet::new(),
+            next_tab_id: 1,
+            direct_page: false,
+            pin_tab: false,
+            bound_target_id: None,
+            bound_target_gone: None,
+            headless: true,
+        };
+
+        let mut sessions = manager.attach_existing_iframe_targets().await;
+        sessions.sort_unstable();
+        assert_eq!(
+            sessions,
+            vec![
+                ("iframe-a".to_string(), "session-iframe-a".to_string()),
+                ("iframe-b".to_string(), "session-iframe-b".to_string()),
+            ]
+        );
     }
 
     const TARGET_A: &str = "AAAA0000BBBB1111CCCC2222DDDD3333";
