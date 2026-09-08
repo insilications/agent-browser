@@ -368,6 +368,8 @@ agent-browser snapshot -i
 agent-browser frame main     # back to main frame
 ```
 
+Frame selection follows renderer swaps that preserve the frame ID. If the selected frame is removed, frame-scoped commands fail explicitly instead of falling back to main; run `agent-browser frame main` before selecting another frame. Explicit top-document navigation and successful tab changes reset frame selection to main.
+
 ### Dialogs
 
 `alert` and `beforeunload` are auto-accepted so agents never block. For `confirm` and `prompt`:

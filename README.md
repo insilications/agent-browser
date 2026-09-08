@@ -376,9 +376,16 @@ Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a di
 ### Frames
 
 ```bash
-agent-browser frame <sel>             # Switch to iframe
+agent-browser frame <sel>             # Switch by CSS selector in the current frame
+agent-browser frame @e3               # Switch by a snapshot ref from the current frame
 agent-browser frame main              # Back to main frame
 ```
+
+Frame selection is relative. After switching into an iframe, another selector or a ref from a new scoped snapshot resolves inside that iframe, including across nested out-of-process iframe boundaries. Snapshot refs are rebuilt by each snapshot, so use refs from the most recent snapshot or a deterministic CSS selector.
+
+`eval` and `wait --fn` run in the current frame's page world, so they can read globals created by that document's own scripts. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
+
+If the selected frame is removed, frame-scoped commands report `Selected frame is no longer available` instead of silently operating on the main document. Use `frame main` to recover, then select a frame again. Short renderer detach/attach transitions that preserve the frame ID are reconciled automatically. Explicit top-document navigation (`open`, `back`, `forward`, `reload`, and `set content`) and successful tab changes reset frame selection to main.
 
 ### Dialogs
 
@@ -430,6 +437,8 @@ agent-browser state clear [name]      # Clear states for session
 agent-browser state clear --all       # Clear all saved states
 agent-browser state clean --older-than <days>  # Delete old states
 ```
+
+Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. OOPIFs in background tabs remain excluded.
 
 ### Navigation
 

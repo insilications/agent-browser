@@ -105,6 +105,10 @@ agent-browser snapshot -i       # Only elements inside that iframe
 agent-browser frame main        # Return to main frame
 ```
 
+Frame switching is relative. After entering an iframe, a selector or a ref from the new scoped snapshot resolves inside the selected frame, including when nesting crosses an out-of-process iframe boundary. Taking a snapshot replaces the current ref map, so refs from earlier snapshots are intentionally no longer available.
+
+If a selected frame is removed, scoped snapshots and other frame-scoped commands fail explicitly rather than falling back to the main document. Use `agent-browser frame main` to recover. Renderer swaps that preserve the frame ID are reconciled automatically, while explicit top-document navigation and successful tab changes reset selection to main.
+
 ## Best practices
 
 1. Use `-i` to reduce output to actionable elements

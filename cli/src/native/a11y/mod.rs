@@ -9,10 +9,11 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{EvaluateResult, RemoteObject};
+use super::frame::{collect_active_frame_topology, FrameTarget};
 
 /// Unmodified axe-core build, injected via `Runtime.evaluate` (which is
 /// not subject to the page's CSP, unlike a CDN `<script>` tag).
@@ -377,165 +378,6 @@ fn collect_frame_ids(tree: &Value, frame_ids: &mut Vec<String>) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct FrameTarget {
-    frame_id: String,
-    session_id: String,
-    parent_id: Option<String>,
-}
-
-fn collect_frame_targets(
-    tree: &Value,
-    parent_session_id: &str,
-    iframe_sessions: &HashMap<String, String>,
-    targets: &mut HashMap<String, FrameTarget>,
-) {
-    let session_id = if let Some(frame) = tree.get("frame") {
-        let Some(frame_id) = frame.get("id").and_then(|id| id.as_str()) else {
-            return;
-        };
-        // Same-process child frames do not have their own target session. They
-        // execute in the nearest ancestor target, which may itself be an
-        // out-of-process iframe rather than the top-level page.
-        let session_id = iframe_sessions
-            .get(frame_id)
-            .cloned()
-            .unwrap_or_else(|| parent_session_id.to_string());
-        let target = FrameTarget {
-            frame_id: frame_id.to_string(),
-            session_id: session_id.clone(),
-            parent_id: frame
-                .get("parentId")
-                .and_then(|id| id.as_str())
-                .map(ToString::to_string),
-        };
-        targets
-            .entry(frame_id.to_string())
-            .and_modify(|existing| {
-                // A tree queried through the frame's dedicated target is the
-                // authoritative source for its execution session and children.
-                if iframe_sessions.get(frame_id) == Some(&session_id) {
-                    let mut authoritative = target.clone();
-                    if authoritative.parent_id.is_none() {
-                        authoritative.parent_id.clone_from(&existing.parent_id);
-                    }
-                    *existing = authoritative;
-                }
-            })
-            .or_insert(target);
-        session_id
-    } else {
-        parent_session_id.to_string()
-    };
-    if let Some(children) = tree.get("childFrames").and_then(|value| value.as_array()) {
-        for child in children {
-            collect_frame_targets(child, &session_id, iframe_sessions, targets);
-        }
-    }
-}
-
-fn frame_reaches_top(
-    frame_id: &str,
-    top_frame_id: &str,
-    targets: &HashMap<String, FrameTarget>,
-) -> bool {
-    let mut current = frame_id;
-    let mut visited = HashSet::new();
-    loop {
-        if current == top_frame_id {
-            return true;
-        }
-        if !visited.insert(current.to_string()) {
-            return false;
-        }
-        let Some(parent_id) = targets
-            .get(current)
-            .and_then(|target| target.parent_id.as_deref())
-        else {
-            return false;
-        };
-        current = parent_id;
-    }
-}
-
-async fn collect_frame_sessions(
-    client: &CdpClient,
-    top_session_id: &str,
-    iframe_sessions: &HashMap<String, String>,
-) -> Result<(String, Vec<FrameTarget>), String> {
-    let top_tree = client
-        .send_command_no_params("Page.getFrameTree", Some(top_session_id))
-        .await?;
-    let top_frame_id = top_tree
-        .get("frameTree")
-        .and_then(|tree| tree.get("frame"))
-        .and_then(|frame| frame.get("id"))
-        .and_then(|id| id.as_str())
-        .ok_or("Could not determine top-level frame ID")?
-        .to_string();
-
-    let mut targets = HashMap::new();
-    if let Some(tree) = top_tree.get("frameTree") {
-        collect_frame_targets(tree, top_session_id, iframe_sessions, &mut targets);
-    }
-
-    // Query every attached iframe target. The top target's frame tree can
-    // omit descendants below an OOPIF, while the OOPIF's own tree exposes
-    // those same-process descendants with the correct execution session.
-    let mut session_entries: Vec<_> = iframe_sessions.values().collect();
-    session_entries.sort_unstable();
-    session_entries.dedup();
-    for session_id in session_entries {
-        let Some(tree) = client
-            .send_command_no_params("Page.getFrameTree", Some(session_id))
-            .await
-            .ok()
-            .and_then(|result| result.get("frameTree").cloned())
-        else {
-            continue;
-        };
-        collect_frame_targets(&tree, session_id, iframe_sessions, &mut targets);
-    }
-
-    // The daemon retains sessions for background tabs. Keep only frames whose
-    // parent chain reaches the active page; audit ordering is resolved later
-    // from axe's frame specs rather than HashMap or attachment order.
-    let mut active_targets: Vec<_> = targets
-        .values()
-        .filter(|target| frame_reaches_top(&target.frame_id, &top_frame_id, &targets))
-        .cloned()
-        .collect();
-    active_targets.sort_unstable_by(|left, right| left.frame_id.cmp(&right.frame_id));
-
-    Ok((top_frame_id, active_targets))
-}
-
-#[cfg(test)]
-fn frame_target(frame_id: &str, session_id: &str, parent_id: Option<&str>) -> FrameTarget {
-    FrameTarget {
-        frame_id: frame_id.to_string(),
-        session_id: session_id.to_string(),
-        parent_id: parent_id.map(ToString::to_string),
-    }
-}
-
-/// Return the dedicated target sessions that belong to the active page's
-/// frame tree. The daemon keeps iframe sessions from background tabs so an
-/// audit can recover them after a tab switch, while network capture uses this
-/// active subset to avoid mixing traffic from different tabs.
-pub async fn active_iframe_session_ids(
-    client: &CdpClient,
-    top_session_id: &str,
-    iframe_sessions: &HashMap<String, String>,
-) -> Result<HashSet<String>, String> {
-    let (_, frame_targets) =
-        collect_frame_sessions(client, top_session_id, iframe_sessions).await?;
-    Ok(frame_targets
-        .into_iter()
-        .filter_map(|target| (target.session_id != top_session_id).then_some(target.session_id))
-        .collect())
-}
-
 #[derive(Debug)]
 struct IsolatedFrameWorld {
     session_id: String,
@@ -631,8 +473,9 @@ pub async fn run_audit(
     tags: Option<&str>,
     selector: Option<&str>,
 ) -> Result<Value, String> {
-    let (top_frame_id, frame_targets) =
-        collect_frame_sessions(client, top_session_id, iframe_sessions).await?;
+    let topology = collect_active_frame_topology(client, top_session_id, iframe_sessions).await?;
+    let top_frame_id = topology.top_frame_id.clone();
+    let frame_targets = topology.targets();
     let contexts = collect_isolated_frame_contexts(client, &top_frame_id, &frame_targets).await?;
 
     // axe.finishRun consumes partials in document preorder. Derive that order
@@ -852,54 +695,6 @@ mod tests {
         collect_frame_ids(&tree, &mut frame_ids);
 
         assert_eq!(frame_ids, vec!["top", "child", "grandchild"]);
-    }
-
-    #[test]
-    fn test_collect_frame_targets_inherits_nearest_ancestor_session() {
-        let tree = json!({
-            "frame": { "id": "top" },
-            "childFrames": [{
-                "frame": { "id": "oopif", "parentId": "top" },
-                "childFrames": [{
-                    "frame": { "id": "same-process-child", "parentId": "oopif" }
-                }]
-            }]
-        });
-        let iframe_sessions = HashMap::from([("oopif".to_string(), "oopif-session".to_string())]);
-        let mut targets = HashMap::new();
-
-        collect_frame_targets(&tree, "top-session", &iframe_sessions, &mut targets);
-
-        assert_eq!(targets.len(), 3);
-        assert_eq!(targets["top"].session_id, "top-session");
-        assert_eq!(targets["oopif"].session_id, "oopif-session");
-        assert_eq!(targets["same-process-child"].session_id, "oopif-session");
-        assert_eq!(
-            targets["same-process-child"].parent_id.as_deref(),
-            Some("oopif")
-        );
-    }
-
-    #[test]
-    fn test_frame_reaches_top_filters_background_frames() {
-        let targets = HashMap::from([
-            ("top".to_string(), frame_target("top", "top-session", None)),
-            (
-                "active-child".to_string(),
-                frame_target("active-child", "active-session", Some("top")),
-            ),
-            (
-                "background".to_string(),
-                frame_target("background", "background-session", None),
-            ),
-            (
-                "background-child".to_string(),
-                frame_target("background-child", "background-session", Some("background")),
-            ),
-        ]);
-
-        assert!(frame_reaches_top("active-child", "top", &targets));
-        assert!(!frame_reaches_top("background-child", "top", &targets));
     }
 
     #[test]

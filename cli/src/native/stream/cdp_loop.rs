@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures_util::FutureExt;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
-use crate::native::cdp::client::CdpClient;
+use crate::native::cdp::client::{cdp_session_matches, CdpClient};
 use crate::native::network;
 
 use super::timestamp_ms;
@@ -21,14 +21,6 @@ fn frame_timestamp_ms(meta: Option<&Value>) -> u64 {
         .filter(|s| *s > 0.0)
         .map(|s| (s * 1000.0) as u64)
         .unwrap_or(0)
-}
-
-fn session_matches(active_session: Option<&str>, event_session: Option<&str>) -> bool {
-    match active_session {
-        Some("") => event_session.is_none_or(str::is_empty),
-        Some(active) => event_session == Some(active),
-        None => false,
-    }
 }
 
 fn main_frame_id(frame_tree: &Value) -> Option<String> {
@@ -68,7 +60,7 @@ async fn publish_url(
     url: &str,
 ) {
     let active_session = cdp_session_id.read().await;
-    if !session_matches(active_session.as_deref(), event_session_id) {
+    if !cdp_session_matches(active_session.as_deref(), event_session_id) {
         return;
     }
     {
@@ -252,7 +244,7 @@ pub(super) async fn cdp_event_loop(
                                                 .get("parentId")
                                                 .and_then(|v| v.as_str())
                                                 .is_none_or(|s| s.is_empty());
-                                            let is_active_session = session_matches(
+                                            let is_active_session = cdp_session_matches(
                                                 session_id.as_deref(),
                                                 evt.session_id.as_deref(),
                                             );
@@ -278,7 +270,7 @@ pub(super) async fn cdp_event_loop(
                                         }
                                     } else if evt.method == "Page.navigatedWithinDocument" {
                                         let is_active_session = supports_same_document_navigation
-                                            && session_matches(
+                                            && cdp_session_matches(
                                                 session_id.as_deref(),
                                                 evt.session_id.as_deref(),
                                             );
