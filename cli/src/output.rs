@@ -2555,12 +2555,13 @@ Examples:
             r##"
 agent-browser frame - Switch frame context
 
-Usage: agent-browser frame <selector|main>
+Usage: agent-browser frame <selector|ref|main>
 
 Switch to an iframe or back to the main frame.
 
 Arguments:
-  <selector>           CSS selector for iframe
+  <selector>           CSS selector for iframe, relative to current frame
+  <ref>                Iframe snapshot ref (@e3 or e3)
   main                 Switch back to main frame
 
 Global Options:
@@ -2570,6 +2571,7 @@ Global Options:
 Examples:
   agent-browser frame "#embed-iframe"
   agent-browser frame "iframe[name='content']"
+  agent-browser frame @e3
   agent-browser frame main
 "##
         }

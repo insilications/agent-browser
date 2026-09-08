@@ -6,7 +6,10 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AXNode, AXProperty, AXValue, EvaluateParams, EvaluateResult, GetFullAXTreeResult,
 };
-use super::element::{resolve_ax_session, RefMap};
+use super::element::{
+    evaluate_in_context, frame_execution_context, resolve_ax_session, FrameContext, RefContext,
+    RefMap,
+};
 
 const INTERACTIVE_ROLES: &[&str] = &[
     "button",
@@ -219,14 +222,23 @@ pub async fn take_snapshot(
     options: &SnapshotOptions,
     ref_map: &mut RefMap,
     frame_id: Option<&str>,
+    frame_session_id: Option<&str>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<String, String> {
+    let (ax_params, effective_session_id) =
+        resolve_ax_session(frame_id, frame_session_id, session_id, iframe_sessions);
     client
-        .send_command_no_params("DOM.enable", Some(session_id))
+        .send_command_no_params("DOM.enable", Some(effective_session_id))
         .await?;
     client
-        .send_command_no_params("Accessibility.enable", Some(session_id))
+        .send_command_no_params("Accessibility.enable", Some(effective_session_id))
         .await?;
+    let frame_context = frame_id.map(|frame_id| FrameContext {
+        frame_id: frame_id.to_string(),
+        session_id: effective_session_id.to_string(),
+    });
+    let execution_context =
+        frame_execution_context(client, session_id, frame_context.as_ref()).await?;
 
     // If a CSS selector is provided, resolve the set of backendNodeIds that
     // belong to the DOM subtree rooted at the matched element.  We use this
@@ -237,17 +249,7 @@ pub async fn take_snapshot(
                 "document.querySelector({})",
                 serde_json::to_string(selector).unwrap_or_default()
             );
-            let result: EvaluateResult = client
-                .send_command_typed(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(false),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await?;
+            let result = evaluate_in_context(client, &execution_context, &js, false, false).await?;
 
             // A throwing evaluation (e.g. an invalid CSS selector like a
             // snapshot ref "@e1") still yields an objectId — for the
@@ -275,7 +277,7 @@ pub async fn take_snapshot(
                 .send_command(
                     "DOM.describeNode",
                     Some(serde_json::json!({ "objectId": object_id, "depth": -1 })),
-                    Some(session_id),
+                    Some(effective_session_id),
                 )
                 .await?;
 
@@ -298,8 +300,6 @@ pub async fn take_snapshot(
             None
         };
 
-    let (ax_params, effective_session_id) =
-        resolve_ax_session(frame_id, session_id, iframe_sessions);
     // Ensure domains are enabled on the iframe session (defensive fallback
     // in case the attach-time enable in execute_command was missed).
     if effective_session_id != session_id {
@@ -360,7 +360,7 @@ pub async fn take_snapshot(
 
     // Pre-collect cursor-interactive elements so we can mark them with refs during tree building
     let cursor_elements: HashMap<i64, CursorElementInfo> =
-        find_cursor_interactive_elements(client, session_id)
+        find_cursor_interactive_elements(client, effective_session_id)
             .await
             .unwrap_or_default();
 
@@ -410,7 +410,10 @@ pub async fn take_snapshot(
             &tree_nodes[*idx].role,
             &tree_nodes[*idx].name,
             actual_nth,
-            frame_id,
+            RefContext {
+                frame_id,
+                session_id: Some(effective_session_id),
+            },
         );
 
         tree_nodes[*idx].has_ref = true;
@@ -444,7 +447,7 @@ pub async fn take_snapshot(
                     .send_command(
                         "DOM.resolveNode",
                         Some(serde_json::json!({ "backendNodeId": bid })),
-                        Some(session_id),
+                        Some(effective_session_id),
                     )
                     .await;
                 let obj_id = resolved.ok().and_then(|r| {
@@ -472,7 +475,7 @@ pub async fn take_snapshot(
                                     "functionDeclaration": "function() { return this.href || ''; }",
                                     "returnByValue": true,
                                 })),
-                                Some(session_id),
+                                Some(effective_session_id),
                             )
                             .await;
                         let href = result.ok().and_then(|r| {
@@ -516,7 +519,12 @@ pub async fn take_snapshot(
                 continue;
             };
             let ref_id = node.ref_id.as_deref().unwrap_or("");
-            if let Ok(child_fid) = resolve_iframe_frame_id(client, session_id, bid).await {
+            if let Ok(child_fid) = resolve_iframe_frame_id(client, effective_session_id, bid).await
+            {
+                let child_session_id = iframe_sessions
+                    .get(&child_fid)
+                    .map(String::as_str)
+                    .unwrap_or(effective_session_id);
                 // Snapshot the child frame; errors are silently ignored
                 // (e.g. cross-origin iframes)
                 if let Ok(child_text) = Box::pin(take_snapshot(
@@ -525,6 +533,7 @@ pub async fn take_snapshot(
                     options,
                     ref_map,
                     Some(&child_fid),
+                    Some(child_session_id),
                     iframe_sessions,
                 ))
                 .await
@@ -1485,8 +1494,12 @@ mod tests {
         let mut iframe_sessions = HashMap::new();
         iframe_sessions.insert(iframe_frame_id.to_string(), iframe_session.to_string());
 
-        let (params, session) =
-            resolve_ax_session(Some(iframe_frame_id), parent_session, &iframe_sessions);
+        let (params, session) = resolve_ax_session(
+            Some(iframe_frame_id),
+            Some(iframe_session),
+            parent_session,
+            &iframe_sessions,
+        );
 
         assert_eq!(session, iframe_session);
         assert_eq!(params, serde_json::json!({}));
@@ -1498,8 +1511,12 @@ mod tests {
         let iframe_frame_id = "same-origin-iframe-frame";
         let iframe_sessions = HashMap::new();
 
-        let (params, session) =
-            resolve_ax_session(Some(iframe_frame_id), parent_session, &iframe_sessions);
+        let (params, session) = resolve_ax_session(
+            Some(iframe_frame_id),
+            None,
+            parent_session,
+            &iframe_sessions,
+        );
 
         assert_eq!(session, parent_session);
         assert_eq!(params, serde_json::json!({ "frameId": iframe_frame_id }));
@@ -1510,10 +1527,25 @@ mod tests {
         let parent_session = "parent-session";
         let iframe_sessions = HashMap::new();
 
-        let (params, session) = resolve_ax_session(None, parent_session, &iframe_sessions);
+        let (params, session) = resolve_ax_session(None, None, parent_session, &iframe_sessions);
 
         assert_eq!(session, parent_session);
         assert_eq!(params, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_nested_same_process_iframe_uses_inherited_oopif_session() {
+        let iframe_sessions = HashMap::from([("oopif".to_string(), "oopif-session".to_string())]);
+
+        let (params, session) = resolve_ax_session(
+            Some("nested-frame"),
+            Some("oopif-session"),
+            "top-session",
+            &iframe_sessions,
+        );
+
+        assert_eq!(session, "oopif-session");
+        assert_eq!(params, serde_json::json!({ "frameId": "nested-frame" }));
     }
 
     // -----------------------------------------------------------------------

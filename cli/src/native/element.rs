@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use super::cdp::client::CdpClient;
@@ -13,6 +14,16 @@ pub struct RefEntry {
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
+    /// CDP session that produced `backend_node_id`. Backend node IDs are only
+    /// meaningful in that target, including for same-process frames nested
+    /// below an OOPIF where `frame_id` has no dedicated target of its own.
+    pub session_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RefContext<'a> {
+    pub frame_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
 }
 
 pub struct RefMap {
@@ -36,7 +47,14 @@ impl RefMap {
         name: &str,
         nth: Option<usize>,
     ) {
-        self.add_with_frame(ref_id, backend_node_id, role, name, nth, None);
+        self.add_with_frame(
+            ref_id,
+            backend_node_id,
+            role,
+            name,
+            nth,
+            RefContext::default(),
+        );
     }
 
     pub fn add_with_frame(
@@ -46,7 +64,7 @@ impl RefMap {
         role: &str,
         name: &str,
         nth: Option<usize>,
-        frame_id: Option<&str>,
+        context: RefContext<'_>,
     ) {
         self.map.insert(
             ref_id,
@@ -56,7 +74,8 @@ impl RefMap {
                 name: name.to_string(),
                 nth,
                 selector: None,
-                frame_id: frame_id.map(|s| s.to_string()),
+                frame_id: context.frame_id.map(|s| s.to_string()),
+                session_id: context.session_id.map(|s| s.to_string()),
             },
         );
     }
@@ -78,6 +97,7 @@ impl RefMap {
                 nth,
                 selector: Some(selector),
                 frame_id: None,
+                session_id: None,
             },
         );
     }
@@ -146,154 +166,112 @@ pub fn parse_ref(input: &str) -> Option<String> {
     None
 }
 
-/// Mirror of DaemonState.active_frame_id, refreshed before every command
+/// A selected browsing context and the CDP target session that executes it.
+/// A same-process frame inherits the nearest ancestor target's session, which
+/// may be an OOPIF session rather than the top-level page session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameContext {
+    pub frame_id: String,
+    pub session_id: String,
+}
+
+/// Mirror of DaemonState.active_frame, refreshed before every command
 /// (commands are serialized by the daemon's state lock, so this cannot
 /// race). It lets CSS-selector resolution honor `frame <sel>` without
 /// threading a parameter through every interaction signature; snapshot refs
-/// already carry their frame through the ref map.
-static ACTIVE_FRAME: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+/// already carry their frame and owning session through the ref map.
+static ACTIVE_FRAME: std::sync::OnceLock<std::sync::Mutex<Option<FrameContext>>> =
     std::sync::OnceLock::new();
 
-pub fn set_active_frame(frame_id: Option<&str>) {
+pub fn set_active_frame(frame: Option<&FrameContext>) {
     *ACTIVE_FRAME
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .unwrap() = frame_id.map(String::from);
+        .unwrap() = frame.cloned();
 }
 
-fn active_frame() -> Option<String> {
+fn active_frame() -> Option<FrameContext> {
     ACTIVE_FRAME.get().and_then(|m| m.lock().unwrap().clone())
 }
 
-/// Object handle for the <iframe> element that owns a frame, resolved on the
-/// parent session. Works for same-process frames where no dedicated CDP
-/// session exists.
-pub(super) async fn frame_owner_object_id(
+/// Runtime execution context for a document. Top-level operations use the
+/// target's default context. Selected frames use an isolated world addressed
+/// by frame ID so same-process cross-origin frames do not depend on
+/// `frameElement.contentDocument` access.
+#[derive(Debug, Clone)]
+pub(super) struct FrameExecutionContext {
+    pub session_id: String,
+    pub context_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextEvaluateParams<'a> {
+    expression: &'a str,
+    return_by_value: bool,
+    await_promise: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_id: Option<i64>,
+}
+
+pub(super) async fn frame_execution_context(
     client: &CdpClient,
-    session_id: &str,
-    frame_id: &str,
-) -> Result<String, String> {
-    let owner = client
+    top_session_id: &str,
+    frame: Option<&FrameContext>,
+) -> Result<FrameExecutionContext, String> {
+    let Some(frame) = frame else {
+        return Ok(FrameExecutionContext {
+            session_id: top_session_id.to_string(),
+            context_id: None,
+        });
+    };
+
+    let result = client
         .send_command(
-            "DOM.getFrameOwner",
-            Some(serde_json::json!({ "frameId": frame_id })),
-            Some(session_id),
+            "Page.createIsolatedWorld",
+            Some(serde_json::json!({
+                "frameId": frame.frame_id,
+                "worldName": "agent-browser-frame",
+                "grantUniveralAccess": true,
+            })),
+            Some(&frame.session_id),
         )
         .await?;
-    let backend_node_id = owner
-        .get("backendNodeId")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| format!("Could not resolve the owner element of frame {}", frame_id))?;
-    let result: DomResolveNodeResult = client
+    let context_id = result
+        .get("executionContextId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            format!(
+                "Could not create execution context for frame {}",
+                frame.frame_id
+            )
+        })?;
+
+    Ok(FrameExecutionContext {
+        session_id: frame.session_id.clone(),
+        context_id: Some(context_id),
+    })
+}
+
+pub(super) async fn evaluate_in_context(
+    client: &CdpClient,
+    context: &FrameExecutionContext,
+    expression: &str,
+    return_by_value: bool,
+    await_promise: bool,
+) -> Result<EvaluateResult, String> {
+    client
         .send_command_typed(
-            "DOM.resolveNode",
-            &DomResolveNodeParams {
-                backend_node_id: Some(backend_node_id),
-                node_id: None,
-                object_group: Some("agent-browser".to_string()),
+            "Runtime.evaluate",
+            &ContextEvaluateParams {
+                expression,
+                return_by_value,
+                await_promise,
+                context_id: context.context_id,
             },
-            Some(session_id),
+            Some(&context.session_id),
         )
-        .await?;
-    result
-        .object
-        .object_id
-        .ok_or_else(|| format!("No objectId for the owner element of frame {}", frame_id))
-}
-
-/// Find a selector inside a same-process iframe and return its center in
-/// top-level viewport coordinates (input events dispatch in that space).
-/// Same-origin access to contentDocument is what makes this possible; a
-/// cross-origin frame never takes this path because it has its own session.
-async fn resolve_center_in_same_process_frame(
-    client: &CdpClient,
-    session_id: &str,
-    frame_id: &str,
-    selector: &str,
-) -> Result<(f64, f64), String> {
-    let owner_object_id = frame_owner_object_id(client, session_id, frame_id).await?;
-    let find_expr = build_find_element_js_in("doc", selector);
-    let function = format!(
-        r#"function() {{
-            const doc = this.contentDocument;
-            if (!doc) return null;
-            const el = {find_expr};
-            if (!el) return null;
-            if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(true);
-            else el.scrollIntoView({{ block: 'center', inline: 'center' }});
-            const rect = el.getBoundingClientRect();
-            let x = rect.x + rect.width / 2;
-            let y = rect.y + rect.height / 2;
-            let win = doc.defaultView;
-            while (win && win.frameElement) {{
-                const frameRect = win.frameElement.getBoundingClientRect();
-                x += frameRect.x + win.frameElement.clientLeft;
-                y += frameRect.y + win.frameElement.clientTop;
-                win = win.parent;
-            }}
-            const blockerAt = {BLOCKER_AT_JS};
-            const topDoc = win ? win.document : doc;
-            return {{ x: x, y: y, blocker: blockerAt(topDoc, el, x, y) }};
-        }}"#,
-    );
-    let result = client
-        .send_command(
-            "Runtime.callFunctionOn",
-            Some(serde_json::json!({
-                "objectId": owner_object_id,
-                "functionDeclaration": function,
-                "returnByValue": true,
-            })),
-            Some(session_id),
-        )
-        .await?;
-    let value = result.get("result").and_then(|r| r.get("value"));
-    if let Some(blocker) = value
-        .and_then(|v| v.get("blocker"))
-        .and_then(|v| v.as_str())
-    {
-        return Err(intercepted_error(selector, blocker));
-    }
-    let x = value.and_then(|v| v.get("x")).and_then(|v| v.as_f64());
-    let y = value.and_then(|v| v.get("y")).and_then(|v| v.as_f64());
-    match (x, y) {
-        (Some(x), Some(y)) => Ok((x, y)),
-        _ => Err(format!(
-            "Element not found in the selected frame: {}",
-            selector
-        )),
-    }
-}
-
-/// Find a selector inside a same-process iframe and return its object handle.
-async fn resolve_object_in_same_process_frame(
-    client: &CdpClient,
-    session_id: &str,
-    frame_id: &str,
-    selector: &str,
-) -> Result<String, String> {
-    let owner_object_id = frame_owner_object_id(client, session_id, frame_id).await?;
-    let find_expr = build_find_element_js_in("doc", selector);
-    let function = format!(
-        "function() {{ const doc = this.contentDocument; if (!doc) return null; return {find_expr}; }}",
-    );
-    let result = client
-        .send_command(
-            "Runtime.callFunctionOn",
-            Some(serde_json::json!({
-                "objectId": owner_object_id,
-                "functionDeclaration": function,
-                "returnByValue": false,
-            })),
-            Some(session_id),
-        )
-        .await?;
-    result
-        .get("result")
-        .and_then(|r| r.get("objectId"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))
+        .await
 }
 
 pub async fn resolve_element_center(
@@ -308,8 +286,12 @@ pub async fn resolve_element_center(
             .get(&ref_id)
             .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
 
-        let effective_session_id =
-            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+        let effective_session_id = resolve_frame_session(
+            entry.frame_id.as_deref(),
+            entry.session_id.as_deref(),
+            session_id,
+            iframe_sessions,
+        );
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
@@ -349,7 +331,10 @@ pub async fn resolve_element_center(
             &entry.role,
             &entry.name,
             entry.nth,
-            entry.frame_id.as_deref(),
+            RefContext {
+                frame_id: entry.frame_id.as_deref(),
+                session_id: entry.session_id.as_deref(),
+            },
             iframe_sessions,
         )
         .await?;
@@ -379,17 +364,11 @@ pub async fn resolve_element_center(
     }
 
     // CSS selector: honor an active `frame <sel>` selection.
-    if let Some(frame_id) = active_frame() {
-        // Cross-process iframe: its dedicated session's main frame IS the
-        // iframe, so plain document-rooted resolution works there.
-        if let Some(frame_session) = iframe_sessions.get(&frame_id) {
-            let (x, y) = resolve_by_selector(client, frame_session, selector_or_ref).await?;
-            return Ok((x, y, frame_session.clone()));
-        }
+    if let Some(frame) = active_frame() {
+        let context = frame_execution_context(client, session_id, Some(&frame)).await?;
         let (x, y) =
-            resolve_center_in_same_process_frame(client, session_id, &frame_id, selector_or_ref)
-                .await?;
-        return Ok((x, y, session_id.to_string()));
+            resolve_center_by_selector_in_context(client, &context, selector_or_ref).await?;
+        return Ok((x, y, context.session_id));
     }
     let (x, y) = resolve_by_selector(client, session_id, selector_or_ref).await?;
     Ok((x, y, session_id.to_string()))
@@ -488,8 +467,12 @@ pub async fn resolve_element_object_id(
             .get(&ref_id)
             .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
 
-        let effective_session_id =
-            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+        let effective_session_id = resolve_frame_session(
+            entry.frame_id.as_deref(),
+            entry.session_id.as_deref(),
+            session_id,
+            iframe_sessions,
+        );
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
@@ -520,7 +503,10 @@ pub async fn resolve_element_object_id(
             &entry.role,
             &entry.name,
             entry.nth,
-            entry.frame_id.as_deref(),
+            RefContext {
+                frame_id: entry.frame_id.as_deref(),
+                session_id: entry.session_id.as_deref(),
+            },
             iframe_sessions,
         )
         .await?;
@@ -543,30 +529,11 @@ pub async fn resolve_element_object_id(
     }
 
     // Selector fallback (CSS or XPath): honor an active `frame <sel>` selection.
-    if let Some(frame_id) = active_frame() {
-        if let Some(frame_session) = iframe_sessions.get(&frame_id) {
-            let js = build_find_element_js(selector_or_ref);
-            let result: EvaluateResult = client
-                .send_command_typed(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(false),
-                        await_promise: Some(false),
-                    },
-                    Some(frame_session.as_str()),
-                )
-                .await?;
-            let object_id = result
-                .result
-                .object_id
-                .ok_or_else(|| format!("Element not found: {}", selector_or_ref))?;
-            return Ok((object_id, frame_session.clone()));
-        }
+    if let Some(frame) = active_frame() {
+        let context = frame_execution_context(client, session_id, Some(&frame)).await?;
         let object_id =
-            resolve_object_in_same_process_frame(client, session_id, &frame_id, selector_or_ref)
-                .await?;
-        return Ok((object_id, session_id.to_string()));
+            resolve_object_by_selector_in_context(client, &context, selector_or_ref).await?;
+        return Ok((object_id, context.session_id));
     }
 
     let js = build_find_element_js(selector_or_ref);
@@ -594,14 +561,21 @@ pub async fn resolve_element_object_id(
 /// same-origin iframes use the parent session with a frameId parameter.
 pub(super) fn resolve_ax_session<'a>(
     frame_id: Option<&str>,
+    frame_session_id: Option<&'a str>,
     session_id: &'a str,
     iframe_sessions: &'a HashMap<String, String>,
 ) -> (serde_json::Value, &'a str) {
     if let Some(frame_id) = frame_id {
-        if let Some(iframe_sid) = iframe_sessions.get(frame_id) {
-            (serde_json::json!({}), iframe_sid.as_str())
+        let effective_session_id = frame_session_id
+            .or_else(|| iframe_sessions.get(frame_id).map(String::as_str))
+            .unwrap_or(session_id);
+        if iframe_sessions.get(frame_id).map(String::as_str) == Some(effective_session_id) {
+            (serde_json::json!({}), effective_session_id)
         } else {
-            (serde_json::json!({ "frameId": frame_id }), session_id)
+            (
+                serde_json::json!({ "frameId": frame_id }),
+                effective_session_id,
+            )
         }
     } else {
         (serde_json::json!({}), session_id)
@@ -613,13 +587,16 @@ pub(super) fn resolve_ax_session<'a>(
 /// Otherwise, return the parent session.
 fn resolve_frame_session<'a>(
     frame_id: Option<&str>,
+    frame_session_id: Option<&'a str>,
     session_id: &'a str,
     iframe_sessions: &'a HashMap<String, String>,
 ) -> &'a str {
-    frame_id
-        .and_then(|fid| iframe_sessions.get(fid))
-        .map(|s| s.as_str())
-        .unwrap_or(session_id)
+    frame_session_id.unwrap_or_else(|| {
+        frame_id
+            .and_then(|fid| iframe_sessions.get(fid))
+            .map(|s| s.as_str())
+            .unwrap_or(session_id)
+    })
 }
 
 /// Re-query the accessibility tree to find a node matching role+name+nth,
@@ -632,11 +609,15 @@ async fn find_node_id_by_role_name(
     role: &str,
     name: &str,
     nth: Option<usize>,
-    frame_id: Option<&str>,
+    context: RefContext<'_>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<i64, String> {
-    let (ax_params, effective_session_id) =
-        resolve_ax_session(frame_id, session_id, iframe_sessions);
+    let (ax_params, effective_session_id) = resolve_ax_session(
+        context.frame_id,
+        context.session_id,
+        session_id,
+        iframe_sessions,
+    );
     let ax_tree: GetFullAXTreeResult = client
         .send_command_typed(
             "Accessibility.getFullAXTree",
@@ -817,6 +798,78 @@ async fn resolve_by_selector(
         (Some(x), Some(y)) => Ok((x, y)),
         _ => Err(format!("Element not found: {}", selector)),
     }
+}
+
+async fn resolve_object_by_selector_in_context(
+    client: &CdpClient,
+    context: &FrameExecutionContext,
+    selector: &str,
+) -> Result<String, String> {
+    let expression = build_find_element_js(selector);
+    let result = evaluate_in_context(client, context, &expression, false, false).await?;
+    if let Some(details) = result.exception_details {
+        let message = details
+            .exception
+            .as_ref()
+            .and_then(|exception| exception.description.as_deref())
+            .unwrap_or(&details.text);
+        return Err(format!("Evaluation error: {}", message));
+    }
+    result
+        .result
+        .object_id
+        .ok_or_else(|| format!("Element not found: {}", selector))
+}
+
+/// Resolve a selector within a selected frame and use the DOM box model for
+/// coordinates. Unlike `getBoundingClientRect`, DOM.getBoxModel reports in the
+/// coordinate space of the owning target, including for a same-process nested
+/// frame selected through an isolated execution context.
+async fn resolve_center_by_selector_in_context(
+    client: &CdpClient,
+    context: &FrameExecutionContext,
+    selector: &str,
+) -> Result<(f64, f64), String> {
+    let object_id = resolve_object_by_selector_in_context(client, context, selector).await?;
+    let _ = client
+        .send_command(
+            "DOM.scrollIntoViewIfNeeded",
+            Some(serde_json::json!({ "objectId": object_id })),
+            Some(&context.session_id),
+        )
+        .await;
+    let result: DomGetBoxModelResult = client
+        .send_command_typed(
+            "DOM.getBoxModel",
+            &DomGetBoxModelParams {
+                backend_node_id: None,
+                node_id: None,
+                object_id: Some(object_id.clone()),
+            },
+            Some(&context.session_id),
+        )
+        .await?;
+    let (x, y) = box_model_center(&result.model);
+
+    if let Ok(describe) = client
+        .send_command(
+            "DOM.describeNode",
+            Some(serde_json::json!({ "objectId": object_id })),
+            Some(&context.session_id),
+        )
+        .await
+    {
+        if let Some(backend_node_id) = describe
+            .get("node")
+            .and_then(|node| node.get("backendNodeId"))
+            .and_then(Value::as_i64)
+        {
+            check_node_interception(client, &context.session_id, backend_node_id, selector, x, y)
+                .await?;
+        }
+    }
+
+    Ok((x, y))
 }
 
 fn intercepted_error(target: &str, blocker: &str) -> String {
@@ -1262,18 +1315,22 @@ pub async fn get_element_count(
     selector: &str,
 ) -> Result<i64, String> {
     let js = build_count_elements_js(selector);
-
-    let result: EvaluateResult = client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &EvaluateParams {
-                expression: js,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(session_id),
-        )
-        .await?;
+    let result = if let Some(frame) = active_frame() {
+        let context = frame_execution_context(client, session_id, Some(&frame)).await?;
+        evaluate_in_context(client, &context, &js, true, false).await?
+    } else {
+        client
+            .send_command_typed(
+                "Runtime.evaluate",
+                &EvaluateParams {
+                    expression: js,
+                    return_by_value: Some(true),
+                    await_promise: Some(false),
+                },
+                Some(session_id),
+            )
+            .await?
+    };
 
     Ok(result.result.value.and_then(|v| v.as_i64()).unwrap_or(0))
 }
@@ -1379,8 +1436,27 @@ mod tests {
     #[test]
     fn test_ref_map_clear_resets_ref_numbering() {
         let mut map = RefMap::new();
-        map.add("e1".to_string(), Some(42), "button", "Submit", None);
+        map.add_with_frame(
+            "e1".to_string(),
+            Some(42),
+            "button",
+            "Submit",
+            None,
+            RefContext {
+                frame_id: Some("child-frame"),
+                session_id: Some("oopif-session"),
+            },
+        );
         map.set_next_ref_num(2);
+
+        assert_eq!(
+            map.get("e1").unwrap().frame_id.as_deref(),
+            Some("child-frame")
+        );
+        assert_eq!(
+            map.get("e1").unwrap().session_id.as_deref(),
+            Some("oopif-session")
+        );
 
         map.clear();
 
@@ -1459,6 +1535,7 @@ mod tests {
 
         let session = resolve_frame_session(
             Some("cross-origin-frame"),
+            None,
             "parent-session",
             &iframe_sessions,
         );
@@ -1472,6 +1549,7 @@ mod tests {
 
         let session = resolve_frame_session(
             Some("same-origin-frame"),
+            None,
             "parent-session",
             &iframe_sessions,
         );
@@ -1483,8 +1561,22 @@ mod tests {
     fn test_main_frame_element_uses_parent_session() {
         let iframe_sessions = HashMap::new();
 
-        let session = resolve_frame_session(None, "parent-session", &iframe_sessions);
+        let session = resolve_frame_session(None, None, "parent-session", &iframe_sessions);
 
         assert_eq!(session, "parent-session");
+    }
+
+    #[test]
+    fn test_nested_frame_element_uses_recorded_ancestor_session() {
+        let iframe_sessions = HashMap::from([("oopif".to_string(), "oopif-session".to_string())]);
+
+        let session = resolve_frame_session(
+            Some("same-process-child"),
+            Some("oopif-session"),
+            "top-session",
+            &iframe_sessions,
+        );
+
+        assert_eq!(session, "oopif-session");
     }
 }

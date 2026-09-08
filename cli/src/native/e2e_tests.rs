@@ -1691,7 +1691,7 @@ async fn e2e_tab_close_with_tab_id_closes_active_tab() {
     assert_eq!(get_data(&resp)["title"], "A");
     assert!(state.ref_map.get("e1").is_none());
     assert!(state.iframe_sessions.is_empty());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
@@ -8645,7 +8645,9 @@ async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {
                         "200 OK",
                         "text/html",
                         r#"<!doctype html><html lang="en"><head><title>Inner</title></head>
-<body><main aria-label="Inner"><h1>Inner</h1><img id="inner-image" src="/missing-inner.png"></main></body></html>"#
+<body><main aria-label="Inner"><h1>Inner</h1><div id="inside-b">hello</div>
+<button id="inside-b-button" onclick="document.body.dataset.clicked = 'true'">Click inside B</button>
+<img id="inner-image" src="/missing-inner.png"></main></body></html>"#
                             .to_string(),
                     ),
                     "/siblings" => (
@@ -8703,6 +8705,312 @@ async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {
     });
 
     (port, handle)
+}
+
+/// Frame selection is relative to the selected document, and both refs and
+/// selectors must retain the CDP session that owns their DOM nodes. The
+/// localhost top page embeds a 127.0.0.1 OOPIF whose inner frame stays in the
+/// OOPIF renderer, exercising the inherited-session case that a frame ID alone
+/// cannot represent.
+#[tokio::test]
+#[ignore]
+async fn e2e_frame_selection_preserves_nested_oopif_context() {
+    fn iframe_ref(resp: &Value, name: &str) -> String {
+        get_data(resp)["refs"]
+            .as_object()
+            .and_then(|refs| {
+                refs.iter().find_map(|(ref_id, entry)| {
+                    (entry["role"] == "Iframe" && entry["name"] == name).then(|| ref_id.clone())
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing iframe ref named {name}: {}",
+                    serde_json::to_string_pretty(resp).unwrap_or_default()
+                )
+            })
+    }
+
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--site-per-process"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Same-process top-level frame, first by selector and then by snapshot ref.
+    let same_process_html = r#"<!doctype html><html><head><title>Same-process top</title></head>
+<body><iframe id="same-process" title="Same process" srcdoc="<div id='same-process-content'>same</div>"></iframe></body></html>"#;
+    let resp = execute_command(
+        &json!({
+            "id": "same-navigate",
+            "action": "navigate",
+            "url": format!("data:text/html;base64,{}", STANDARD.encode(same_process_html))
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "same-selector", "action": "frame", "selector": "#same-process" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "same-text", "action": "gettext", "selector": "#same-process-content" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "same");
+    assert_success(
+        &execute_command(
+            &json!({ "id": "same-main", "action": "mainframe" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "same-snapshot", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let same_process_ref = iframe_ref(&resp, "Same process");
+    let resp = execute_command(
+        &json!({ "id": "same-ref", "action": "frame", "selector": same_process_ref }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "same-ref-text", "action": "gettext", "selector": "#same-process-content" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "same");
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://localhost:{port}/top")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        !state.iframe_sessions.is_empty(),
+        "fixture must attach the outer frame as an OOPIF"
+    );
+
+    // Selector path: each selector is relative to the currently selected frame.
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "frame", "selector": "#outer" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "frame", "selector": "#inner" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "gettext", "selector": "#inside-b" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "hello");
+
+    let resp = execute_command(
+        &json!({ "id": "5b", "action": "click", "selector": "#inside-b-button" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "[location.href, document.body.dataset.clicked]" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["result"][0]
+        .as_str()
+        .is_some_and(|url| url.ends_with("/inner")));
+    assert_eq!(get_data(&resp)["result"][1], "true");
+
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["snapshot"]
+        .as_str()
+        .is_some_and(|snapshot| snapshot.contains("Inner")));
+
+    let resp = execute_command(&json!({ "id": "8", "action": "mainframe" }), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "evaluate", "script": "document.title" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "Top");
+
+    // Ref path: the inner iframe ref is produced by the outer OOPIF session.
+    let resp = execute_command(
+        &json!({ "id": "10", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let outer_ref = iframe_ref(&resp, "Outer");
+    let resp = execute_command(
+        &json!({ "id": "11", "action": "frame", "selector": format!("@{outer_ref}") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "12", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let inner_ref = iframe_ref(&resp, "Inner");
+    let resp = execute_command(
+        &json!({ "id": "13", "action": "frame", "selector": inner_ref }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "14", "action": "gettext", "selector": "#inside-b" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "hello");
+
+    let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    server.abort();
+}
+
+/// Connecting to an already-loaded browser must recover OOPIF sessions whose
+/// auto-attach events occurred before the new daemon subscribed to CDP events.
+#[tokio::test]
+#[ignore]
+async fn e2e_connect_recovers_preexisting_oopif_session() {
+    let (port, server) = start_a11y_frame_server().await;
+    let mut owner = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "owner-launch",
+            "action": "launch",
+            "headless": true,
+            "args": ["--site-per-process"]
+        }),
+        &mut owner,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "owner-navigate",
+            "action": "navigate",
+            "url": format!("http://localhost:{port}/top")
+        }),
+        &mut owner,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        !owner.iframe_sessions.is_empty(),
+        "fixture must create its OOPIF before the second daemon connects"
+    );
+    let cdp_url = owner
+        .browser
+        .as_ref()
+        .expect("owner browser")
+        .get_cdp_url()
+        .to_string();
+
+    let mut attached = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "connect", "action": "launch", "cdpUrl": cdp_url }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        !attached.iframe_sessions.is_empty(),
+        "connect must seed the dedicated session for an existing OOPIF"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "snapshot-main", "action": "snapshot", "interactive": true }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["snapshot"]
+        .as_str()
+        .is_some_and(|snapshot| snapshot.contains("Inner")));
+
+    let resp = execute_command(
+        &json!({ "id": "frame-outer", "action": "frame", "selector": "#outer" }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "snapshot-outer", "action": "snapshot", "interactive": true }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["snapshot"]
+        .as_str()
+        .is_some_and(|snapshot| snapshot.contains("Inner")));
+
+    let resp = execute_command(
+        &json!({ "id": "frame-inner", "action": "frame", "selector": "#inner" }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "inside", "action": "gettext", "selector": "#inside-b" }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "hello");
+
+    let _ = close_current_browser(&mut attached).await;
+    let _ = close_current_browser(&mut owner).await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -8844,7 +9152,10 @@ async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {
     state
         .ref_map
         .add("e999".to_string(), Some(999), "button", "stale", None);
-    state.active_frame_id = Some("stale-frame".to_string());
+    state.active_frame = Some(super::element::FrameContext {
+        frame_id: "stale-frame".to_string(),
+        session_id: "stale-session".to_string(),
+    });
     state
         .iframe_sessions
         .insert("stale-frame".to_string(), "stale-session".to_string());
@@ -8861,7 +9172,7 @@ async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {
     .await;
     assert_success(&resp);
     assert!(state.ref_map.get("e999").is_none());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
     assert!(!state.iframe_sessions.contains_key("stale-frame"));
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;

@@ -1305,7 +1305,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_FRAME_SWITCH,
             "Frame switch",
-            "Switch frame by selector, ref, or id.",
+            "Switch to an iframe by selector or snapshot ref, resolved relative to the current frame.",
             json!({ "frame": { "type": "string" } }),
             &["frame"],
         ),

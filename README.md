@@ -376,9 +376,12 @@ Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a di
 ### Frames
 
 ```bash
-agent-browser frame <sel>             # Switch to iframe
+agent-browser frame <sel>             # Switch by CSS selector in the current frame
+agent-browser frame @e3               # Switch by a snapshot ref from the current frame
 agent-browser frame main              # Back to main frame
 ```
+
+Frame selection is relative. After switching into an iframe, another selector or a ref from a new scoped snapshot resolves inside that iframe, including across nested out-of-process iframe boundaries. Snapshot refs are rebuilt by each snapshot, so use refs from the most recent snapshot or a deterministic CSS selector.
 
 ### Dialogs
 
