@@ -42,6 +42,8 @@ agent-browser dialog dismiss
 
 By default, `alert` and `beforeunload` dialogs are automatically accepted so they do not block the agent. `confirm` and `prompt` dialogs still require explicit handling. Use `--no-auto-dialog` or `AGENT_BROWSER_NO_AUTO_DIALOG=1` to disable automatic handling.
 
+These rules also apply while existing out-of-process iframes are recovered during launch or connection. Configured request handling, including proxy authentication, remains active during recovery; events emitted before CDP attachment are not captured.
+
 When a dialog is pending, command responses include a `warning` field with the dialog type and message so agents can recover with `dialog accept` or `dialog dismiss`.
 
 ## DevTools and visual inspection

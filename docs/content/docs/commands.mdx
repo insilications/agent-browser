@@ -325,6 +325,8 @@ agent-browser dialog status           # Check if a dialog is currently open
 
 By default, `alert` and `beforeunload` dialogs are automatically accepted so they never block the agent. `confirm` and `prompt` dialogs still require explicit handling. Use `--no-auto-dialog` (or `AGENT_BROWSER_NO_AUTO_DIALOG=1`) to disable automatic handling.
 
+Automatic dialog handling is active while existing out-of-process iframes are recovered during browser launch or connection, subject to the same dialog types and opt-out setting.
+
 When a JavaScript dialog (`alert`, `confirm`, `prompt`) is pending, all command responses include a `warning` field with the dialog type and message.
 
 ## Streaming

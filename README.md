@@ -425,6 +425,8 @@ agent-browser dialog status           # Check if a dialog is currently open
 
 By default, `alert` and `beforeunload` dialogs are automatically accepted so they never block the agent. `confirm` and `prompt` dialogs still require explicit handling. Use `--no-auto-dialog` (or `AGENT_BROWSER_NO_AUTO_DIALOG=1`) to disable automatic handling.
 
+Automatic dialog handling is active while existing out-of-process iframes are recovered during browser launch or connection, subject to the same dialog types and opt-out setting.
+
 When a JavaScript dialog is pending, all command responses include a `warning` field with the dialog type and message.
 
 ### Diff
@@ -1094,7 +1096,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--idle-timeout <time>` | Shut down the daemon after inactivity (`10s`, `3m`, `1h`, or raw ms). Defaults to `1h`; use `0` to disable (or `AGENT_BROWSER_IDLE_TIMEOUT_MS` env) |
 | `--engine <name>` | Browser engine: `chrome` (default), `lightpanda`, `obscura` (experimental; rejects proxy bypass rules) (or `AGENT_BROWSER_ENGINE` env) |
 | `AGENT_BROWSER_OBSCURA_STEALTH` env | Run the Obscura engine (`--engine obscura`) in stealth mode: consistent fingerprint, tracker blocking |
-| `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |
+| `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs, including during existing-iframe recovery (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |
 | `--model <name>` | AI model for chat command (or `AI_GATEWAY_MODEL` env) |
 | `-v`, `--verbose` | Show tool commands and their raw output (chat) |
 | `-q`, `--quiet` | Show only AI text responses, hide tool calls (chat) |
@@ -1549,6 +1551,8 @@ The `--cdp` flag accepts either:
 - A full WebSocket URL (e.g., `wss://...` or `ws://...`) for remote browser services
 
 Root WebSocket endpoints accept query strings with or without an explicit slash, so both `wss://browser-service.com?token=...` and `wss://browser-service.com/?token=...` work.
+
+During browser launch or connection, configured request handling and automatic dialog handling remain active while existing out-of-process iframes are recovered. This includes proxy authentication during recovery on provider connections. It does not capture events emitted before the daemon attaches over CDP or change which connection modes support `--allowed-domains`.
 
 This enables control of:
 

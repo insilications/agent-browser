@@ -3301,6 +3301,10 @@ Usage: agent-browser connect <port|url>
 
 Connects to a running browser instance via Chrome DevTools Protocol (CDP).
 This allows controlling browsers, Electron apps, or remote browser services.
+Configured request handling and automatic alert/beforeunload handling remain
+active during recovery of existing out-of-process iframes. --no-auto-dialog
+also disables automatic handling during recovery. Events before CDP attachment
+are not captured; allowed-domain connection restrictions are unchanged.
 
 Arguments:
   <port>               Local port number (e.g., 9222)
@@ -4092,7 +4096,7 @@ Options:
                              bypass settings, even with an existing daemon; stale daemon
                              environment values are not reused when bypass is cleared.
                              Obscura has accessibility, iframe, and screenshot fidelity gaps.
-  --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
+  --no-auto-dialog           Disable automatic alert/beforeunload dismissal, including iframe recovery (or AGENT_BROWSER_NO_AUTO_DIALOG)
   --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
   -v, --verbose              Show tool commands and their raw output
   -q, --quiet                Show only AI text responses (hide tool calls)
@@ -4189,7 +4193,7 @@ Environment:
   AGENT_BROWSER_ACTION_POLICY    Path to action policy JSON file
   AGENT_BROWSER_CONFIRM_ACTIONS  Action categories requiring confirmation
   AGENT_BROWSER_CONFIRM_INTERACTIVE Enable interactive confirmation prompts
-  AGENT_BROWSER_NO_AUTO_DIALOG   Disable automatic dismissal of alert/beforeunload dialogs
+  AGENT_BROWSER_NO_AUTO_DIALOG   Disable automatic alert/beforeunload dismissal, including iframe recovery
   AGENT_BROWSER_PLUGINS          JSON plugin registry override
   AGENT_BROWSER_ENGINE           Browser engine: chrome (default), lightpanda, obscura (experimental)
   OBSCURA_BIN                   Source E2E tests only: required executable path when explicitly

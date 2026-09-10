@@ -827,10 +827,48 @@ impl DaemonState {
         s
     }
 
-    fn subscribe_to_browser_events(&mut self) {
-        if let Some(ref browser) = self.browser {
-            self.event_rx = Some(browser.client.subscribe());
+    /// Register every event receiver before recovery can enable Fetch or resume
+    /// an existing iframe. Handler startup subscribes synchronously, so events
+    /// remain queued even before the background tasks are first polled.
+    async fn initialize_browser_event_handling(&mut self) -> Result<(), String> {
+        let Some(ref browser) = self.browser else {
+            return Ok(());
+        };
+        self.event_rx = Some(browser.client.subscribe());
+        self.start_fetch_handler();
+        self.start_dialog_handler();
+        self.recover_existing_iframe_sessions().await
+    }
+
+    /// Stop all event consumers before asynchronous connection cleanup, including
+    /// cleanup after failed or timed-out iframe recovery. Safe to call repeatedly.
+    fn stop_browser_event_handling(&mut self) {
+        self.event_rx = None;
+        if let Some(task) = self.fetch_handler_task.take() {
+            task.abort();
         }
+        if let Some(task) = self.dialog_handler_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn recover_existing_iframe_sessions(&mut self) -> Result<(), String> {
+        let Some(ref browser) = self.browser else {
+            return Ok(());
+        };
+
+        // Per-page auto-attach is enabled while BrowserManager connects, before
+        // this receiver exists. Recover OOPIF targets that predate the
+        // connection, then feed them through the same setup path as live
+        // Target.attachedToTarget events.
+        let recovered = browser.attach_existing_iframe_targets().await;
+        let mut drained = self.drain_cdp_events();
+        for pair in recovered {
+            if !drained.attached_iframe_sessions.contains(&pair) {
+                drained.attached_iframe_sessions.push(pair);
+            }
+        }
+        self.apply_drained_events(drained).await
     }
 
     /// Start the background task that processes Fetch.requestPaused and
@@ -2193,12 +2231,7 @@ impl Drop for DaemonState {
     fn drop(&mut self) {
         // The background fetch handler sits in rx.recv().await indefinitely.
         // Without aborting it, the tokio runtime won't shut down (tests hang).
-        if let Some(task) = self.fetch_handler_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.dialog_handler_task.take() {
-            task.abort();
-        }
+        self.stop_browser_event_handling();
     }
 }
 
@@ -2491,6 +2524,7 @@ async fn close_active_provider_session(state: &mut DaemonState) -> Result<(), St
 }
 
 pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
+    state.stop_browser_event_handling();
     let browser = state.browser.take();
     state.launch_hash = None;
     state.webmcp_enabled = false;
@@ -4133,9 +4167,7 @@ async fn auto_launch_inner(
         state.reset_input_state();
         state.browser = Some(mgr);
         state.launch_hash = Some(hash);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.start_dialog_handler();
+        state.initialize_browser_event_handling().await?;
         apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
@@ -4176,9 +4208,7 @@ async fn auto_launch_inner(
             }
         }
         state.launch_hash = Some(hash);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.start_dialog_handler();
+        state.initialize_browser_event_handling().await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
@@ -4233,9 +4263,7 @@ async fn auto_launch_inner(
                     state.reset_input_state();
                     state.browser = Some(mgr);
                     state.launch_hash = Some(hash);
-                    state.subscribe_to_browser_events();
-                    state.start_fetch_handler();
-                    state.start_dialog_handler();
+                    state.initialize_browser_event_handling().await?;
                     state.update_stream_client().await;
                     write_provider_file(&state.session_id, &p);
                     install_network_controls_or_close(state, has_proxy_auth).await?;
@@ -4300,9 +4328,7 @@ async fn auto_launch_inner(
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
     state.effective_ca_cert = effective_ca_cert;
-    state.subscribe_to_browser_events();
-    state.start_fetch_handler();
-    state.start_dialog_handler();
+    state.initialize_browser_event_handling().await?;
     state.update_stream_client().await;
     install_network_controls_or_close(state, has_proxy_auth).await?;
 
@@ -5142,9 +5168,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.start_dialog_handler();
+        state.initialize_browser_event_handling().await?;
         apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
@@ -5159,9 +5183,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.start_dialog_handler();
+        state.initialize_browser_event_handling().await?;
         apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
@@ -5182,9 +5204,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
             }
         }
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.start_dialog_handler();
+        state.initialize_browser_event_handling().await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
@@ -5242,9 +5262,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
                         state.reset_input_state();
                         state.browser = Some(mgr);
                         state.launch_hash = Some(new_hash);
-                        state.subscribe_to_browser_events();
-                        state.start_fetch_handler();
-                        state.start_dialog_handler();
+                        state.initialize_browser_event_handling().await?;
                         state.update_stream_client().await;
                         write_provider_file(&state.session_id, provider);
                         install_network_controls_or_close(state, has_proxy_auth).await?;
@@ -5293,9 +5311,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     state.session_setup = SessionSetup::from_launch_options(&launch_options);
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
     state.launch_hash = Some(new_hash);
-    state.subscribe_to_browser_events();
-    state.start_fetch_handler();
-    state.start_dialog_handler();
+    state.initialize_browser_event_handling().await?;
     state.update_stream_client().await;
 
     // Install containment before loading state or running user init scripts.
@@ -5701,10 +5717,6 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     let save_result = auto_save_restore_state(state).await;
     close_all_browser_backends(state).await?;
 
-    // Stop background Fetch handler
-    if let Some(task) = state.fetch_handler_task.take() {
-        task.abort();
-    }
     {
         let mut map = state.origin_headers.write().await;
         map.clear();
@@ -14150,6 +14162,394 @@ mod tests {
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn browser_event_initialization_services_recovery_events() {
+        use crate::test_utils::browser_events::{
+            isolated_env, BrowserEventServer, Scenario, IFRAME_SESSION, TEST_TIMEOUT,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated_env(directory.path());
+        let server = BrowserEventServer::start(Scenario::default()).await;
+        let mut state = DaemonState::new();
+        let result = tokio::time::timeout(
+            TEST_TIMEOUT,
+            handle_launch(
+                &json!({"cdpUrl":server.url, "proxy":{"username":"fixture-user", "password":"fixture-password"}}),
+                &mut state,
+            ),
+        ).await;
+        if matches!(result, Ok(Ok(_))) {
+            server.assert_late_events_handled(true).await;
+        }
+        close_current_browser(&mut state).await.unwrap();
+        assert_browser_event_handling_stopped(&state);
+        let commands = server.commands();
+        if matches!(result, Ok(Ok(_))) {
+            server.assert_recovery_requests(true, false);
+        }
+        server.finish().await;
+        result
+            .expect("recovery must service Fetch and dialog events before completing")
+            .unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|cmd| cmd["method"] == "Page.handleJavaScriptDialog"
+                    && cmd["sessionId"] == IFRAME_SESSION)
+                .count(),
+            1
+        );
+    }
+
+    fn assert_browser_event_handling_stopped(state: &DaemonState) {
+        assert!(state.event_rx.is_none());
+        assert!(state.fetch_handler_task.is_none());
+        assert!(state.dialog_handler_task.is_none());
+        assert!(state.browser.is_none());
+        assert!(state.launch_hash.is_none());
+        assert!(state.iframe_sessions.is_empty());
+        assert!(state.active_iframe_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_event_initialization_preserves_dialog_policy() {
+        use crate::test_utils::browser_events::{
+            dialog_event, isolated_env, BrowserEventServer, Scenario, IFRAME_SESSION, PAGE_SESSION,
+            TEST_TIMEOUT,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let guard = isolated_env(directory.path());
+        for (dialog, auto_dialog) in [
+            ("beforeunload", true),
+            ("alert", false),
+            ("beforeunload", false),
+            ("confirm", true),
+            ("prompt", true),
+        ] {
+            guard.set(
+                "AGENT_BROWSER_NO_AUTO_DIALOG",
+                if auto_dialog { "0" } else { "1" },
+            );
+            let server = BrowserEventServer::start(Scenario {
+                dialog,
+                auto_dialog,
+                ..Default::default()
+            })
+            .await;
+            let mut state = DaemonState::new();
+            tokio::time::timeout(TEST_TIMEOUT, handle_launch(
+                &json!({"cdpUrl":server.url, "proxy":{"username":"fixture-user", "password":"fixture-password"}}),
+                &mut state,
+            )).await.unwrap().unwrap();
+            server.assert_late_events_handled(auto_dialog).await;
+            server.assert_recovery_requests(true, false);
+            let automatic = auto_dialog && matches!(dialog, "alert" | "beforeunload");
+            let responses: Vec<_> = server
+                .commands()
+                .into_iter()
+                .filter(|cmd| {
+                    cmd["method"] == "Page.handleJavaScriptDialog"
+                        && cmd["sessionId"] == IFRAME_SESSION
+                })
+                .collect();
+            assert_eq!(
+                responses.len(),
+                usize::from(automatic),
+                "{dialog}, auto={auto_dialog}"
+            );
+            if automatic {
+                assert_eq!(responses[0]["params"]["accept"], true);
+            } else {
+                assert_eq!(state.dialog_handler_task.is_some(), auto_dialog);
+                // Explicit tracking remains page-scoped. Exercise the existing
+                // status/accept path with the equivalent page-session event.
+                server.emit(dialog_event(PAGE_SESSION, dialog)).await;
+                state
+                    .browser
+                    .as_ref()
+                    .unwrap()
+                    .client
+                    .send_command_no_params("Browser.getVersion", None)
+                    .await
+                    .unwrap();
+                state.drain_cdp_events();
+                let status = handle_dialog(&json!({"response":"status"}), &mut state)
+                    .await
+                    .unwrap();
+                assert_eq!(status["type"], dialog);
+                assert_eq!(
+                    state.pending_dialog.as_ref().unwrap().session_id.as_deref(),
+                    Some(PAGE_SESSION)
+                );
+                let result = handle_dialog(
+                    &json!({"response":"accept", "promptText":"fixture input"}),
+                    &mut state,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result["accepted"], true);
+                assert!(state.pending_dialog.is_none());
+                assert!(server
+                    .commands()
+                    .iter()
+                    .any(|cmd| cmd["method"] == "Page.handleJavaScriptDialog"
+                        && cmd["params"]["promptText"] == "fixture input"));
+            }
+            close_current_browser(&mut state).await.unwrap();
+            assert_browser_event_handling_stopped(&state);
+            server.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_event_initialization_deduplicates_recovery_and_relaunches() {
+        use crate::test_utils::browser_events::{
+            isolated_env, BrowserEventServer, Scenario, IFRAME_SESSION, TEST_TIMEOUT,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated_env(directory.path());
+        let mut state = DaemonState::new();
+        for _ in 0..2 {
+            let server = BrowserEventServer::start(Scenario {
+                attachment_event: true,
+                ..Default::default()
+            })
+            .await;
+            tokio::time::timeout(TEST_TIMEOUT, handle_launch(
+                &json!({"cdpUrl":server.url, "proxy":{"username":"fixture-user", "password":"fixture-password"}}),
+                &mut state,
+            )).await.unwrap().unwrap();
+            assert_eq!(
+                state.iframe_sessions.get("iframe").map(String::as_str),
+                Some(IFRAME_SESSION)
+            );
+            assert!(state.active_iframe_sessions.contains(IFRAME_SESSION));
+            // The Fetch handler also prepares attached targets. DOM.enable is
+            // specific to the main recovery path, which must run only once.
+            assert_eq!(
+                server
+                    .commands()
+                    .iter()
+                    .filter(
+                        |cmd| cmd["method"] == "DOM.enable" && cmd["sessionId"] == IFRAME_SESSION
+                    )
+                    .count(),
+                1
+            );
+            server.assert_recovery_requests(true, false);
+            server.assert_late_events_handled(true).await;
+            handle_close(&mut state).await.unwrap();
+            assert_browser_event_handling_stopped(&state);
+            // The old connection has closed before replacement. No stale event
+            // task can keep it alive or respond on the replacement connection.
+            server.finish().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_event_initialization_services_provider_launch_matrix() {
+        use crate::test_utils::browser_events::{
+            isolated_env, BrowserEventServer, MockProvider, Scenario, TEST_TIMEOUT,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let guard = isolated_env(directory.path());
+        for explicit in [true, false] {
+            for proxy_auth in [true, false] {
+                let server = BrowserEventServer::start(Scenario::default()).await;
+                let provider = MockProvider::new(&server.url);
+                guard.set("AGENT_BROWSER_PROVIDER", &provider.config.name);
+                guard.remove("AGENT_BROWSER_PROXY_USERNAME");
+                guard.remove("AGENT_BROWSER_PROXY_PASSWORD");
+                guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+                if proxy_auth {
+                    guard.set("AGENT_BROWSER_PROXY_USERNAME", "fixture-user");
+                    guard.set("AGENT_BROWSER_PROXY_PASSWORD", "fixture-password");
+                } else {
+                    guard.set("AGENT_BROWSER_ALLOWED_DOMAINS", "page.test,frame.test");
+                }
+                let mut state = DaemonState::new();
+                let result = tokio::time::timeout(TEST_TIMEOUT, async {
+                    if explicit {
+                        handle_launch(
+                            &json!({"provider":provider.config.name, "plugins":[provider.config]}),
+                            &mut state,
+                        )
+                        .await
+                        .map(|_| ())
+                    } else {
+                        auto_launch(&mut state, vec![provider.config.clone()]).await
+                    }
+                })
+                .await;
+                assert!(
+                    matches!(result, Ok(Ok(()))),
+                    "explicit={explicit}, proxy={proxy_auth}: {result:?}"
+                );
+                assert!(state.active_provider_connection);
+                assert_eq!(
+                    state
+                        .active_provider_session
+                        .as_ref()
+                        .unwrap()
+                        .session
+                        .provider,
+                    "plugin:startup-fixture"
+                );
+                server.assert_recovery_requests(proxy_auth, !proxy_auth);
+                server.assert_late_events_handled(true).await;
+                close_current_browser(&mut state).await.unwrap();
+                assert_browser_event_handling_stopped(&state);
+                assert!(state.active_provider_session.is_none());
+                assert!(!state.active_provider_connection);
+                let requests = provider.requests();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| r["type"] == "browser.launch")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| r["type"] == "browser.close")
+                        .count(),
+                    1
+                );
+                server.finish().await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_event_initialization_preparation_failure_stops_handlers() {
+        use crate::test_utils::browser_events::{
+            isolated_env, BrowserEventServer, MockProvider, RecoveryFailure, Scenario, TEST_TIMEOUT,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated_env(directory.path());
+        for cleanup_success in [true, false] {
+            let server = BrowserEventServer::start(Scenario {
+                failure: RecoveryFailure::Preparation,
+                ..Default::default()
+            })
+            .await;
+            let provider = MockProvider::new(&server.url);
+            provider.set_cleanup_success(cleanup_success);
+            let mut state = DaemonState::new();
+            let error = tokio::time::timeout(TEST_TIMEOUT, handle_launch(
+                &json!({"provider":provider.config.name, "plugins":[provider.config], "allowedDomains":["page.test", "frame.test"]}),
+                &mut state,
+            )).await.unwrap().unwrap_err();
+            assert!(
+                error.contains("Failed to install browser network controls"),
+                "{error}"
+            );
+            assert!(
+                error.contains("injected iframe preparation failure"),
+                "{error}"
+            );
+            assert_browser_event_handling_stopped(&state);
+            // Plugin cleanup is best-effort today, even if its response fails.
+            assert!(state.active_provider_session.is_none());
+            assert!(!state.active_provider_connection);
+            assert_eq!(
+                provider
+                    .requests()
+                    .iter()
+                    .filter(|r| r["type"] == "browser.close")
+                    .count(),
+                1
+            );
+            server.finish().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_event_initialization_timeout_cleanup_preserves_provider_policy() {
+        use crate::test_utils::browser_events::{
+            isolated_env, BrowserEventServer, MockProvider, RecoveryFailure, Scenario,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated_env(directory.path());
+        for cleanup_fails in [false, true] {
+            let server = BrowserEventServer::start(Scenario {
+                failure: RecoveryFailure::Stall,
+                ..Default::default()
+            })
+            .await;
+            let provider = MockProvider::new(&server.url);
+            let mut state = DaemonState::new();
+            let command = json!({"provider":provider.config.name, "plugins":[provider.config]});
+            {
+                let launch = handle_launch(&command, &mut state);
+                tokio::pin!(launch);
+                tokio::select! {
+                    result = &mut launch => panic!("recovery must stay blocked: {result:?}"),
+                    _ = server.wait_for(|cmd| cmd["method"] == "Target.attachToTarget" && cmd["params"]["targetId"] == "iframe") => {}
+                }
+                // Cancel setup at a known recovery boundary, exactly as the
+                // setup timeout does, without racing a wall-clock delay.
+            }
+            assert!(state.browser.is_some() && state.launch_hash.is_some());
+            assert!(state.fetch_handler_task.is_some() && state.dialog_handler_task.is_some());
+            assert!(state.active_provider_session.is_some());
+            if cleanup_fails {
+                // Reuse the existing Browser Use failure policy without a
+                // cloud API: missing credentials make cleanup fail locally.
+                state.active_provider_session = Some(pending_browser_use_session());
+            }
+            let error = browser_use_setup_timeout(&mut state).await;
+            assert!(error.contains("setup timed out"), "{error}");
+            assert_browser_event_handling_stopped(&state);
+            server.finish().await;
+            if cleanup_fails {
+                assert!(state.active_provider_connection);
+                let expected = pending_browser_use_session().session.session_id;
+                assert!(error.contains(&expected), "{error}");
+                assert_eq!(
+                    state
+                        .active_provider_session
+                        .as_ref()
+                        .unwrap()
+                        .session
+                        .session_id,
+                    expected
+                );
+                assert!(close_current_browser(&mut state).await.is_err());
+                assert_eq!(
+                    state
+                        .active_provider_session
+                        .as_ref()
+                        .unwrap()
+                        .session
+                        .session_id,
+                    expected
+                );
+            } else {
+                assert!(!state.active_provider_connection);
+                assert!(state.active_provider_session.is_none());
+                assert_eq!(
+                    provider
+                        .requests()
+                        .iter()
+                        .filter(|r| r["type"] == "browser.close")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
 
     #[test]
     fn screenshot_pixel_ratio_counts_changed_pixels() {

@@ -423,6 +423,8 @@ agent-browser dialog accept "text"    # accept with prompt input
 agent-browser dialog dismiss          # cancel
 ```
 
+Configured request handling and automatic dialog handling are active during recovery of existing out-of-process iframes at launch or connection. `--no-auto-dialog` disables automatic acceptance during recovery too; `confirm` and `prompt` still require explicit handling. Events emitted before CDP attachment are not covered, and existing `--allowed-domains` connection restrictions still apply.
+
 ## Diagnosing install issues
 
 On Windows, locally launched headless Chrome uses a private desktop to prevent visible desktop rectangles in affected Chromium versions. Browser automation, screenshots, and GPU rendering remain available through CDP. Use `--headed` when the browser needs to be visible; sessions with extensions also use the interactive desktop. The daemon owns its Chrome process tree and Windows terminates that tree even if the daemon is forcibly killed. Browsers attached through `--cdp` or `--auto-connect` remain externally owned.

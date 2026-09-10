@@ -304,6 +304,8 @@ Selection is relative to the current frame. After entering one iframe, the next 
 
 By default, `alert` and `beforeunload` dialogs are automatically accepted so they never block the agent. `confirm` and `prompt` dialogs still require explicit handling. Use `--no-auto-dialog` to disable this behavior.
 
+These rules also apply during recovery of existing out-of-process iframes at launch or connection. Configured request handling, including proxy authentication, remains active during recovery too. This does not capture events before CDP attachment or expand support for `--allowed-domains` to other connection modes.
+
 ```bash
 agent-browser dialog accept [text]  # Accept dialog
 agent-browser dialog dismiss        # Dismiss dialog

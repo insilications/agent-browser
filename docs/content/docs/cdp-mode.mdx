@@ -37,6 +37,8 @@ The `--cdp` flag accepts either:
 
 Root WebSocket endpoints accept query strings with or without an explicit slash, so both `wss://browser-service.com?token=...` and `wss://browser-service.com/?token=...` work.
 
+During browser launch or connection, configured request handling and automatic dialog handling remain active while existing out-of-process iframes are recovered. This includes proxy authentication during recovery on provider connections. It does not capture events emitted before the daemon attaches over CDP or change which connection modes support `--allowed-domains`.
+
 ## Auto-Connect
 
 Use `--auto-connect` to automatically discover and connect to a running Chrome instance without specifying a port:

@@ -770,7 +770,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_OPEN,
             "Open page",
-            "Launch the browser and optionally navigate to a URL. On Windows, owned headless Chrome uses a private desktop and its process tree closes with the daemon, including forced termination. Headed browsers use the interactive desktop. Successful navigation responses include WebMCP availability metadata when the page exposes allowed tools.",
+            "Launch the browser and optionally navigate to a URL. Configured request handling and automatic alert/beforeunload handling remain active during recovery of existing out-of-process iframes, respecting --no-auto-dialog and existing allowed-domain restrictions. On Windows, owned headless Chrome uses a private desktop and its process tree closes with the daemon, including forced termination. Headed browsers use the interactive desktop. Successful navigation responses include WebMCP availability metadata when the page exposes allowed tools.",
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
@@ -1719,7 +1719,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_CONNECT,
             "Connect CDP",
-            "Connect to a browser over CDP. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state.",
+            "Connect to a browser over CDP. Configured request handling and automatic alert/beforeunload handling remain active during existing-iframe recovery, respecting --no-auto-dialog; events before CDP attachment are not captured. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state.",
             json!({
                 "target": { "type": "string", "description": "CDP port or URL." },
                 "pinTab": { "type": "boolean", "description": "Strict session-to-tab binding (sticky for the session). Explicit false disables a sticky pin; omitted leaves it unchanged." }
@@ -2482,6 +2482,10 @@ fn call_one_string(arguments: &Value, command: &str, key: &str) -> Result<Value,
 }
 
 fn call_connect(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, connect_command_args(arguments)?, None)
+}
+
+fn connect_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     let mut args = vec!["connect".to_string()];
     args.push(required_string(arguments, "target")?);
     match arguments.get("pinTab").and_then(|v| v.as_bool()) {
@@ -2489,7 +2493,7 @@ fn call_connect(arguments: &Value) -> Result<Value, ProtocolError> {
         Some(false) => args.push("--no-pin-tab".to_string()),
         None => {}
     }
-    call_cli_tool(arguments, args, None)
+    Ok(args)
 }
 
 fn call_optional_one(arguments: &Value, parts: &[&str], key: &str) -> Result<Value, ProtocolError> {
@@ -4925,6 +4929,39 @@ mod tests {
                 url
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_connect_services_browser_event_initialization() {
+        use crate::native::actions::{close_current_browser, execute_command, DaemonState};
+        use crate::test_utils::browser_events::{
+            isolated_env, BrowserEventServer, Scenario, TEST_TIMEOUT,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let guard = isolated_env(directory.path());
+        guard.set("AGENT_BROWSER_PROXY_USERNAME", "fixture-user");
+        guard.set("AGENT_BROWSER_PROXY_PASSWORD", "fixture-password");
+        let server = BrowserEventServer::start(Scenario::default()).await;
+        let arguments = json!({"target":server.url, "pinTab":false});
+        let args =
+            cli_tool_args(&arguments, connect_command_args(&arguments).unwrap(), None).unwrap();
+        let flags = crate::flags::parse_flags(&args);
+        let mut command =
+            crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
+        crate::attach_pin_tab_to_command(&mut command, &flags);
+        assert_eq!(command["action"], "launch");
+        assert_eq!(command["cdpUrl"], server.url);
+        assert_eq!(command["pinTab"], false);
+        let mut state = DaemonState::new();
+        let response = tokio::time::timeout(TEST_TIMEOUT, execute_command(&command, &mut state))
+            .await
+            .unwrap();
+        assert_eq!(response["success"], true, "{response}");
+        server.assert_recovery_requests(true, false);
+        server.assert_late_events_handled(true).await;
+        close_current_browser(&mut state).await.unwrap();
+        server.finish().await;
     }
 
     #[tokio::test]
