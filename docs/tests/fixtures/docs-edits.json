@@ -8,6 +8,30 @@
       {
         "from": "# Clear CA trust retained by the running session",
         "to": "# Clear CA trust retained by the running session\n--use-system-ca          # Use the OS trust store for CLI requests (read, install, upgrade, doctor)"
+      },
+      {
+        "from": "agent-browser frame <sel>                      # Switch to iframe by CSS selector",
+        "to": "agent-browser frame <sel>                      # Switch by CSS selector in the current frame"
+      },
+      {
+        "from": "agent-browser frame @e3                        # Switch to iframe by element ref",
+        "to": "agent-browser frame @e3                        # Switch by a ref from the current frame's snapshot"
+      },
+      {
+        "from": "`snapshot --delta` returns `full`, `unchanged`, or incremental updates per tab and option set. URL changes or large deltas return full state; `--full` resets the baseline. Apply a delta’s `changes` to ref metadata and `treeChange` to the previous tree: split on newlines, replace `deleteCount` lines at zero-based `startLine` with `lines`, then rejoin. Apply both to `baseRevision` before advancing to `revision`.",
+        "to": "`snapshot --delta` returns `full`, `unchanged`, or incremental updates per tab and option set. Selected-frame, document, renderer, URL, or option changes and large deltas return full state. There is one baseline per tab, so returning to a previously selected frame also returns full state; `--full` resets the baseline. Apply a delta’s `changes` to ref metadata and `treeChange` to the previous tree: split on newlines, replace `deleteCount` lines at zero-based `startLine` with `lines`, then rejoin. Apply both to `baseRevision` before advancing to `revision`."
+      },
+      {
+        "from": "The `frame` command accepts element refs (`@e3`), CSS selectors (`\"#my-iframe\"`), or frame name/URL.",
+        "to": "The `frame` command accepts element refs (`@e3` or `e3`) and CSS selectors (`\"#my-iframe\"`). Selection is relative to the current frame, so after entering one iframe the next selector is evaluated in that iframe's document. A ref from a new scoped snapshot is resolved in the CDP session that produced it, including for nested same-process, cross-origin, and out-of-process iframes. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid."
+      },
+      {
+        "from": "snapshot --delta returns full, unchanged, or incremental updates per tab and option set. URL changes or large deltas return full state; --full resets the baseline. Apply a delta’s changes to ref metadata and treeChange to the previous tree: split on newlines, replace deleteCount lines at zero-based startLine with lines, then rejoin. Apply both to baseRevision before advancing to revision.",
+        "to": "snapshot --delta returns full, unchanged, or incremental updates per tab and option set. Selected-frame, document, renderer, URL, or option changes and large deltas return full state. There is one baseline per tab, so returning to a previously selected frame also returns full state; --full resets the baseline. Apply a delta’s changes to ref metadata and treeChange to the previous tree: split on newlines, replace deleteCount lines at zero-based startLine with lines, then rejoin. Apply both to baseRevision before advancing to revision."
+      },
+      {
+        "from": "The frame command accepts element refs (@e3), CSS selectors (\"#my-iframe\"), or frame name/URL.",
+        "to": "The frame command accepts element refs (@e3 or e3) and CSS selectors (\"#my-iframe\"). Selection is relative to the current frame, so after entering one iframe the next selector is evaluated in that iframe's document. A ref from a new scoped snapshot is resolved in the CDP session that produced it, including for nested same-process, cross-origin, and out-of-process iframes. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid."
       }
     ],
     "/configuration": [
@@ -40,6 +64,9 @@
     ]
   },
   "resources": {
-    "/schema.json": { "size": 9427, "sha256": "eecb6f5aa3f6c7f0a4f0fb1176923c5b7d005065fea101ff90394c2845b97468" }
+    "/schema.json": {
+      "size": 9427,
+      "sha256": "eecb6f5aa3f6c7f0a4f0fb1176923c5b7d005065fea101ff90394c2845b97468"
+    }
   }
 }
