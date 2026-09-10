@@ -9015,6 +9015,109 @@ async fn e2e_frame_selection_preserves_nested_oopif_context() {
     server.abort();
 }
 
+/// Connecting to an already-loaded browser must recover OOPIF sessions whose
+/// auto-attach events occurred before the new daemon subscribed to CDP events.
+#[tokio::test]
+#[ignore]
+async fn e2e_connect_recovers_preexisting_oopif_session() {
+    let (port, server) = start_a11y_frame_server().await;
+    let mut owner = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "owner-launch",
+            "action": "launch",
+            "headless": true,
+            "args": ["--site-per-process"]
+        }),
+        &mut owner,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "owner-navigate",
+            "action": "navigate",
+            "url": format!("http://localhost:{port}/top")
+        }),
+        &mut owner,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        !owner.iframe_sessions.is_empty(),
+        "fixture must create its OOPIF before the second daemon connects"
+    );
+    let cdp_url = owner
+        .browser
+        .as_ref()
+        .expect("owner browser")
+        .get_cdp_url()
+        .to_string();
+
+    let mut attached = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "connect", "action": "launch", "cdpUrl": cdp_url }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        !attached.iframe_sessions.is_empty(),
+        "connect must seed the dedicated session for an existing OOPIF"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "snapshot-main", "action": "snapshot", "interactive": true }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["snapshot"]
+        .as_str()
+        .is_some_and(|snapshot| snapshot.contains("Inner")));
+
+    let resp = execute_command(
+        &json!({ "id": "frame-outer", "action": "frame", "selector": "#outer" }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "snapshot-outer", "action": "snapshot", "interactive": true }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["snapshot"]
+        .as_str()
+        .is_some_and(|snapshot| snapshot.contains("Inner")));
+
+    let resp = execute_command(
+        &json!({ "id": "frame-inner", "action": "frame", "selector": "#inner" }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "inside", "action": "gettext", "selector": "#inside-b" }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "hello");
+    let resp = execute_command(
+        &json!({ "id": "inside-eval", "action": "evaluate", "script": "window.INNER_REALM" }),
+        &mut attached,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "inner-main-world");
+
+    let _ = close_current_browser(&mut attached).await;
+    let _ = close_current_browser(&mut owner).await;
+    server.abort();
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {

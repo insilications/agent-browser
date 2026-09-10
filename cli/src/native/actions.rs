@@ -687,10 +687,24 @@ impl DaemonState {
         s
     }
 
-    fn subscribe_to_browser_events(&mut self) {
-        if let Some(ref browser) = self.browser {
-            self.event_rx = Some(browser.client.subscribe());
+    async fn subscribe_to_browser_events(&mut self) -> Result<(), String> {
+        let Some(ref browser) = self.browser else {
+            return Ok(());
+        };
+        self.event_rx = Some(browser.client.subscribe());
+
+        // Per-page auto-attach is enabled while BrowserManager connects, before
+        // this receiver exists. Recover OOPIF targets that predate the
+        // connection, then feed them through the same setup path as live
+        // Target.attachedToTarget events.
+        let recovered = browser.attach_existing_iframe_targets().await;
+        let mut drained = self.drain_cdp_events();
+        for pair in recovered {
+            if !drained.attached_iframe_sessions.contains(&pair) {
+                drained.attached_iframe_sessions.push(pair);
+            }
         }
+        self.apply_drained_events(drained).await
     }
 
     /// Start the background task that processes Fetch.requestPaused and
@@ -3564,7 +3578,7 @@ async fn auto_launch(
         state.reset_input_state();
         state.browser = Some(mgr);
         state.launch_hash = Some(hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         apply_tab_binding_on_attach_or_rollback(state).await?;
@@ -3607,7 +3621,7 @@ async fn auto_launch(
             }
         }
         state.launch_hash = Some(hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
@@ -3672,7 +3686,7 @@ async fn auto_launch(
                     state.browser = Some(mgr);
                     state.launch_hash = Some(hash);
                     remember_active_provider_session(state, conn.session.clone(), &plugins);
-                    state.subscribe_to_browser_events();
+                    state.subscribe_to_browser_events().await?;
                     state.start_fetch_handler();
                     state.start_dialog_handler();
                     state.update_stream_client().await;
@@ -3737,7 +3751,7 @@ async fn auto_launch(
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
     state.effective_ca_cert = effective_ca_cert;
-    state.subscribe_to_browser_events();
+    state.subscribe_to_browser_events().await?;
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
@@ -4522,7 +4536,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         apply_tab_binding_on_attach_or_rollback(state).await?;
@@ -4539,7 +4553,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         apply_tab_binding_on_attach_or_rollback(state).await?;
@@ -4562,7 +4576,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             }
         }
         state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
+        state.subscribe_to_browser_events().await?;
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
@@ -4630,7 +4644,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                             conn.session.clone(),
                             &command_plugins,
                         );
-                        state.subscribe_to_browser_events();
+                        state.subscribe_to_browser_events().await?;
                         state.start_fetch_handler();
                         state.start_dialog_handler();
                         state.update_stream_client().await;
@@ -4683,7 +4697,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.reset_input_state();
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
     state.launch_hash = Some(new_hash);
-    state.subscribe_to_browser_events();
+    state.subscribe_to_browser_events().await?;
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
