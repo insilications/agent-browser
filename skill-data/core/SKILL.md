@@ -100,7 +100,7 @@ agent-browser snapshot -i --delta         # full state once, then compact change
 agent-browser snapshot -i --delta --full  # force full state and refresh baseline
 ```
 
-Use `--delta` to reduce repeated output and `--full` to reset the baseline.
+Use `--delta` to reduce repeated output and `--full` to reset the baseline. Switching frames or replacing the selected document or renderer starts a new full observation.
 
 Snapshot output looks like:
 

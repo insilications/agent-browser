@@ -52,7 +52,7 @@ agent-browser snapshot --delta     # Full state once, then bounded structural de
 agent-browser snapshot --delta --full # Force full state and refresh baseline
 ```
 
-Delta history is per tab and option set. Responses are `full`, `unchanged`, or `delta`; URL changes or large deltas return full state. For a delta, apply `changes` (`add`, `remove`, `replace`) to ref metadata. Split the previous tree on newlines, splice `treeChange.lines` at zero-based `startLine`, replacing `deleteCount` lines, then join with newlines. Apply both parts to `baseRevision` before advancing to `revision`; use `--full` if the baseline is unavailable.
+Delta history is per tab and option set. Responses are `full`, `unchanged`, or `delta`; Selected-frame, document, renderer, URL, or option changes and large deltas return full state. There is one baseline per tab, so returning to a previously selected frame also returns full state. For a delta, apply `changes` (`add`, `remove`, `replace`) to ref metadata. Split the previous tree on newlines, splice `treeChange.lines` at zero-based `startLine`, replacing `deleteCount` lines, then join with newlines. Apply both parts to `baseRevision` before advancing to `revision`; use `--full` if the baseline is unavailable.
 
 ## Interactions (use @refs from snapshot)
 
@@ -106,6 +106,8 @@ agent-browser is checked @e1      # Check if checked
 ```
 
 ## Screenshots and PDF
+
+Plain screenshots remain page-wide regardless of frame selection. Conditional selector and annotation baselines include their document and renderer identities; ref selectors use their recorded document. Unknown document identity breaks comparison continuity. Existing iframe crop and annotation geometry limitations are unchanged; frame-safe baselines do not imply iframe-only capture.
 
 ```bash
 agent-browser screenshot          # Save to temporary directory
@@ -264,8 +266,8 @@ Switching to a tab that the browser discarded to save memory reactivates it, sin
 ## Frames
 
 ```bash
-agent-browser frame "#iframe"     # Switch to iframe by CSS selector
-agent-browser frame @e3           # Switch to iframe by element ref
+agent-browser frame "#iframe"     # Switch by CSS selector in the current frame
+agent-browser frame @e3           # Switch by a ref from the current frame's snapshot
 agent-browser frame main          # Back to main frame
 ```
 
@@ -290,9 +292,13 @@ agent-browser frame main              # Return to main frame
 ```
 
 The `frame` command accepts:
-- **Element refs** — `frame @e3` resolves the ref to an iframe element
+
+- **Element refs** — `frame @e3` and `frame e3` resolve the ref to an iframe element
 - **CSS selectors** — `frame "#payment-iframe"` finds the iframe by selector
-- **Frame name/URL** — matches against the browser's frame tree
+
+Selection is relative to the current frame. After entering one iframe, the next selector is evaluated in that iframe's document, and a ref from a new scoped snapshot resolves in the CDP session that produced it. This works across nested same-process, cross-origin, and out-of-process iframe boundaries. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid.
+
+`eval` and `wait --fn` run in the current frame's page world, so application globals defined by that frame are visible. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
 
 ## Dialogs
 

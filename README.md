@@ -400,9 +400,14 @@ Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a di
 ### Frames
 
 ```bash
-agent-browser frame <sel>             # Switch to iframe
+agent-browser frame <sel>             # Switch by CSS selector in the current frame
+agent-browser frame @e3               # Switch by a snapshot ref from the current frame
 agent-browser frame main              # Back to main frame
 ```
+
+Frame selection is relative. After switching into an iframe, another selector or a ref from a new scoped snapshot resolves inside that iframe, including across nested out-of-process iframe boundaries. Surviving DOM elements keep their refs across same-document snapshots. Document replacement invalidates affected refs without recycling their IDs; take a fresh snapshot after navigation.
+
+`eval` and `wait --fn` run in the current frame's page world, so they can read globals created by that document's own scripts. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
 
 ### Dialogs
 
@@ -997,7 +1002,7 @@ agent-browser snapshot --delta --full      # Force full state and refresh the ba
 | `--delta`              | Return full state once, then `unchanged` or a structural JSON delta     |
 | `--full`               | Force full state and update the delta baseline                          |
 
-`--delta` returns `full`, `unchanged`, or incremental updates per tab and option set. It falls back to full state after URL changes or when a delta would not save space. See the [delta response format](skill-data/core/references/commands.md#snapshot-page-analysis) for applying updates.
+`--delta` returns `full`, `unchanged`, or incremental updates per tab and option set. It falls back to full state after selected-frame, document, renderer, URL, or option changes, and when a delta would not save space. Returning to a previously selected frame also starts with full state. See the [delta response format](skill-data/core/references/commands.md#snapshot-page-analysis) for applying updates.
 
 ## Annotated Screenshots
 
@@ -1083,6 +1088,8 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `-q`, `--quiet` | Show only AI text responses, hide tool calls (chat) |
 | `--config <path>` | Use a custom config file (or `AGENT_BROWSER_CONFIG` env) |
 | `--debug` | Debug output |
+
+Plain screenshots remain page-wide regardless of frame selection. Conditional selector and annotation baselines include their document and renderer identities; ref selectors use their recorded document. Unknown document identity breaks comparison continuity. Existing iframe crop and annotation geometry limitations are unchanged; frame-safe baselines do not imply iframe-only capture.
 
 ## Observability Dashboard
 

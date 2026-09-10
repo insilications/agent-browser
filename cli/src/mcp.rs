@@ -843,7 +843,7 @@ fn tools() -> Vec<Value> {
                 "depth": { "type": "integer", "minimum": 0, "description": "Limit tree depth." },
                 "selector": { "type": "string", "description": "Scope the snapshot to a CSS selector." },
                 "includeUrls": { "type": "boolean", "default": false, "description": "Include href URLs on links." },
-                "delta": { "type": "boolean", "default": false, "description": "Return full state once, then unchanged or bounded structural deltas. Apply changes to refs and treeChange (zero-based startLine, deleteCount, lines) to the previous tree." },
+                "delta": { "type": "boolean", "default": false, "description": "Return full state once, then unchanged or bounded structural deltas. Frame, document, renderer, URL, or option changes force full state; history is one baseline per tab. Apply changes to refs and treeChange (zero-based startLine, deleteCount, lines) to the previous tree." },
                 "full": { "type": "boolean", "default": false, "description": "Force full state while updating the delta baseline." }
             }),
             &[],
@@ -926,7 +926,7 @@ fn tools() -> Vec<Value> {
         wait_tool(TOOL_WAIT_FOR_TEXT, "Wait for text", "Wait for text to appear.", json!({ "text": { "type": "string" } }), &["text"]),
         wait_tool(TOOL_WAIT_FOR_URL, "Wait for URL", "Wait for the current URL to match a pattern.", json!({ "url": { "type": "string", "description": "URL glob or pattern." } }), &["url"]),
         wait_tool(TOOL_WAIT_FOR_LOAD, "Wait for load state", "Wait for a page load state.", json!({ "state": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] } }), &["state"]),
-        wait_tool(TOOL_WAIT_FOR_FUNCTION, "Wait for function", "Wait for a JavaScript expression to become truthy.", json!({ "expression": { "type": "string" } }), &["expression"]),
+        wait_tool(TOOL_WAIT_FOR_FUNCTION, "Wait for function", "Wait for a JavaScript expression in the current frame's page world to become truthy.", json!({ "expression": { "type": "string" } }), &["expression"]),
         tool(
             TOOL_SCREENSHOT,
             "Take screenshot",
@@ -939,7 +939,7 @@ fn tools() -> Vec<Value> {
                 "format": { "type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format." },
                 "quality": { "type": "integer", "minimum": 0, "maximum": 100, "description": "JPEG quality." },
                 "screenshotDir": { "type": "string", "description": "Default output directory when path is omitted." },
-                "ifChanged": { "type": "boolean", "default": false, "description": "Recommended for repeated captures to save tokens: return image content only when pixels changed." },
+                "ifChanged": { "type": "boolean", "default": false, "description": "Return image content only when pixels changed. Plain captures remain page-wide; selector/annotation baselines include document and renderer identity, using ref provenance where applicable. Existing iframe crop/annotation geometry limitations remain." },
                 "threshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Maximum changed-pixel ratio to treat as unchanged. Implies ifChanged." }
             }),
             &[],
@@ -953,7 +953,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_EVAL,
             "Evaluate JavaScript",
-            "Run JavaScript in the page using stdin to avoid shell escaping.",
+            "Run JavaScript in the current frame's page world using stdin to avoid shell escaping. Page-defined globals are visible.",
             json!({
                 "script": { "type": "string", "description": "JavaScript expression or script to evaluate." }
             }),
@@ -1319,7 +1319,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_FRAME_SWITCH,
             "Frame switch",
-            "Switch frame by selector, ref, or id.",
+            "Switch to an iframe by selector or snapshot ref, resolved relative to the current frame.",
             json!({ "frame": { "type": "string" } }),
             &["frame"],
         ),
@@ -4186,12 +4186,22 @@ mod tests {
         for arguments in [
             json!({}),
             json!({"interactive": false, "selector": "#content"}),
+            json!({"delta": true, "selector": "#inside"}),
+            json!({"delta": true, "full": true}),
         ] {
             let args = snapshot_command_args(&arguments).unwrap();
             let flags = crate::flags::parse_flags(&args);
             let command = crate::commands::parse_command(&args, &flags).unwrap();
             assert_eq!(command["action"], "snapshot");
             assert_eq!(command.get("selector"), arguments.get("selector"));
+            assert_eq!(
+                command["delta"].as_bool().unwrap_or(false),
+                arguments["delta"].as_bool().unwrap_or(false)
+            );
+            assert_eq!(
+                command["full"].as_bool().unwrap_or(false),
+                arguments["full"].as_bool().unwrap_or(false)
+            );
             assert_eq!(
                 command["interactive"].as_bool().unwrap_or(false),
                 arguments["interactive"].as_bool().unwrap_or(true)

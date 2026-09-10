@@ -80,6 +80,10 @@ Headless Chromium screenshots hide native scrollbars for consistent image output
 
 Annotated screenshots also cache refs, so you can interact with elements immediately. This is useful when the text snapshot is insufficient for unlabeled icons, canvas content, or visual layout verification.
 
+## Conditional screenshot scope
+
+Plain screenshots remain page-wide regardless of frame selection. Conditional selector and annotation baselines include their document and renderer identities; ref selectors use their recorded document. Unknown document identity breaks comparison continuity. Existing iframe crop and annotation geometry limitations are unchanged; frame-safe baselines do not imply iframe-only capture.
+
 ## Iframes
 
 Snapshots automatically detect and inline iframe content. Each `Iframe` node in the main frame is resolved and its child accessibility tree is included directly beneath it. Refs assigned to elements inside iframes carry frame context, so interactions work without switching frames first.
@@ -104,6 +108,8 @@ agent-browser frame @e2
 agent-browser snapshot -i       # Only elements inside that iframe
 agent-browser frame main        # Return to main frame
 ```
+
+Frame switching is relative. After entering an iframe, a selector or a ref from the new scoped snapshot resolves inside the selected frame, including when nesting crosses an out-of-process iframe boundary. Surviving DOM elements retain refs in the same document; replacing a document invalidates its refs without recycling IDs.
 
 ## Best practices
 

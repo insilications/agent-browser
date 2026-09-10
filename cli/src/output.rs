@@ -2128,7 +2128,7 @@ Modes:
   <ms>                 Wait for specified milliseconds
   --url <pattern>      Wait for URL to match pattern
   --load <state>       Wait for load state (load, domcontentloaded, networkidle)
-  --fn <expression>    Wait for JavaScript expression to be truthy
+  --fn <expression>    Wait for current-frame page-world JavaScript to be truthy
   --text <text>        Wait for text to appear on page (substring match)
   --download [path]    Wait for a download to complete (optionally save to path)
 
@@ -2192,6 +2192,10 @@ Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
 
+Plain screenshots remain page-wide. Conditional selector/annotation history
+is document- and renderer-scoped; ref selectors use snapshot provenance.
+Existing iframe crop/annotation geometry limitations remain unchanged.
+
 Examples:
   agent-browser screenshot
   agent-browser screenshot ./screenshot.png
@@ -2244,6 +2248,9 @@ Options:
                        Deltas include ref changes and an exact treeChange line splice
       --full           Force full state and update the delta baseline
 
+  Frame, document, renderer, URL, or option changes return full state.
+  Delta history keeps one baseline per tab, including when switching frames.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -2266,7 +2273,8 @@ agent-browser eval - Execute JavaScript
 
 Usage: agent-browser eval [options] <script>
 
-Executes JavaScript code in the browser context and returns the result.
+Executes JavaScript code in the current frame's page world and returns the result.
+After `frame`, page-defined globals from that frame are visible.
 
 Options:
   -b, --base64         Decode script from base64 (avoids shell escaping issues)
@@ -2719,12 +2727,13 @@ Examples:
             r##"
 agent-browser frame - Switch frame context
 
-Usage: agent-browser frame <selector|main>
+Usage: agent-browser frame <selector|ref|main>
 
 Switch to an iframe or back to the main frame.
 
 Arguments:
-  <selector>           CSS selector for iframe
+  <selector>           CSS selector for iframe, relative to current frame
+  <ref>                Iframe snapshot ref (@e3 or e3)
   main                 Switch back to main frame
 
 Global Options:
@@ -2734,6 +2743,7 @@ Global Options:
 Examples:
   agent-browser frame "#embed-iframe"
   agent-browser frame "iframe[name='content']"
+  agent-browser frame @e3
   agent-browser frame main
 "##
         }
