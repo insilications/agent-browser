@@ -472,6 +472,8 @@ agent-browser state clear --all       # Clear all saved states
 agent-browser state clean --older-than <days>  # Delete old states
 ```
 
+Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. OOPIFs in background tabs remain excluded.
+
 With recording `--cursor`, the pointer and click ripple render with the page, keeping drags synchronized in every captured frame. The temporary overlay is inert, hidden from accessibility snapshots, and removed when recording stops. Screenshots taken during the recording include it.
 
 ### Navigation
