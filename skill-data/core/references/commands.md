@@ -447,6 +447,8 @@ agent-browser profiler start              # Start Chrome DevTools profiling
 agent-browser profiler stop trace.json    # Stop and save profile
 ```
 
+Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. OOPIFs in background tabs are not included.
+
 ## React / Web Vitals
 
 Requires `--enable react-devtools` at launch for the `react ...` commands. `vitals` and `pushstate` are framework-agnostic.

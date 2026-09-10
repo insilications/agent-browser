@@ -8715,7 +8715,8 @@ setTimeout(() => { window.INNER_READY = true; }, 50);
 /// selectors must retain the CDP session that owns their DOM nodes. The
 /// localhost top page embeds a 127.0.0.1 OOPIF whose inner frame stays in the
 /// OOPIF renderer, exercising the inherited-session case that a frame ID alone
-/// cannot represent.
+/// cannot represent. User-authored JavaScript and page-wide Runtime events
+/// must use the same context and active-session ownership.
 #[tokio::test]
 #[ignore]
 async fn e2e_frame_selection_preserves_nested_oopif_context() {
@@ -8909,6 +8910,50 @@ async fn e2e_frame_selection_preserves_nested_oopif_context() {
     )
     .await;
     assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "6-runtime-events",
+            "action": "evaluate",
+            "script": "console.log('nested-oopif-console-marker'); setTimeout(() => { throw new Error('nested-oopif-error-marker'); }, 0); true"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "6-console", "action": "console" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let console_matches = get_data(&resp)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("nested-oopif-console-marker"))
+        })
+        .count();
+    assert_eq!(console_matches, 1);
+
+    let resp = execute_command(&json!({ "id": "6-errors", "action": "errors" }), &mut state).await;
+    assert_success(&resp);
+    let error_matches = get_data(&resp)["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("nested-oopif-error-marker"))
+        })
+        .count();
+    assert_eq!(error_matches, 1);
 
     let resp = execute_command(
         &json!({ "id": "7", "action": "snapshot", "interactive": true }),

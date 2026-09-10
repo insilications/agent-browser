@@ -333,6 +333,8 @@ agent-browser highlight <sel>         # Highlight element
 agent-browser inspect                 # Open Chrome DevTools for the active page
 ```
 
+Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. OOPIFs belonging to background tabs remain excluded.
+
 See [Debugging](/debugging) for console, error, dialog, trace, highlight, and DevTools workflows. See [Video Recording](/recording) for `record` workflows and [Profiler](/profiler) for performance profiles.
 
 ## Auth vault

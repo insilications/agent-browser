@@ -247,6 +247,17 @@ fn is_active_iframe_network_event(
         && session_id.is_some_and(|sid| active_iframe_sessions.contains(sid))
 }
 
+fn is_active_iframe_runtime_event(
+    method: &str,
+    session_id: Option<&str>,
+    active_iframe_sessions: &HashSet<String>,
+) -> bool {
+    matches!(
+        method,
+        "Runtime.consoleAPICalled" | "Runtime.exceptionThrown"
+    ) && session_id.is_some_and(|sid| active_iframe_sessions.contains(sid))
+}
+
 fn active_frame_scope_may_have_changed(drained: &DrainedEvents) -> bool {
     !drained.attached_iframe_sessions.is_empty()
         || !drained.detached_iframe_sessions.is_empty()
@@ -472,8 +483,8 @@ pub struct DaemonState {
     /// Target.detachedFromTarget events remove stale sessions.
     pub iframe_sessions: HashMap<String, String>,
     /// Dedicated iframe sessions reachable from the currently active page.
-    /// Network tracking uses this subset so background-tab iframe traffic is
-    /// not mixed into the active tab's request list or HAR capture.
+    /// Network and Runtime event tracking use this subset so background-tab
+    /// iframe activity is not mixed into the active tab's diagnostics.
     pub active_iframe_sessions: HashSet<String>,
     /// Origin-scoped extra HTTP headers set via `--headers` on navigate.
     /// Key is the origin (scheme + host + port), value is the headers map.
@@ -1032,7 +1043,7 @@ impl DaemonState {
     async fn apply_drained_events(&mut self, drained: DrainedEvents) -> Result<(), String> {
         // Popups and externally closed pages can change the active top-level
         // target without changing iframe topology. Refresh after either kind
-        // of event so network capture stays scoped to the active page.
+        // of event so page-wide diagnostics stay scoped to the active page.
         let active_frame_scope_changed = active_frame_scope_may_have_changed(&drained);
         // ACK screencast frames
         if !drained.pending_acks.is_empty() {
@@ -1551,6 +1562,16 @@ impl DaemonState {
                             &self.active_iframe_sessions,
                         );
 
+                    // Runtime events from same-process frames arrive on the
+                    // top page session. Admit the equivalent events from OOPIF
+                    // sessions that belong to the active page as well.
+                    let iframe_runtime_event = !session_matches
+                        && is_active_iframe_runtime_event(
+                            &event.method,
+                            event.session_id.as_deref(),
+                            &self.active_iframe_sessions,
+                        );
+
                     let webmcp_event = event.session_id.as_deref().is_some_and(|sid| {
                         (matches!(
                             event.method.as_str(),
@@ -1568,7 +1589,11 @@ impl DaemonState {
                                     || self.iframe_sessions.values().any(|known| known == sid)))
                     });
 
-                    if !session_matches && !iframe_network_event && !webmcp_event {
+                    if !session_matches
+                        && !iframe_network_event
+                        && !iframe_runtime_event
+                        && !webmcp_event
+                    {
                         continue;
                     }
 
@@ -12708,6 +12733,34 @@ mod tests {
             "Network.requestWillBeSent",
             Some("active-iframe"),
             false,
+            &active_sessions,
+        ));
+    }
+
+    #[test]
+    fn test_iframe_runtime_events_are_scoped_to_active_page_sessions() {
+        let active_sessions = HashSet::from(["active-iframe".to_string()]);
+
+        for method in ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"] {
+            assert!(is_active_iframe_runtime_event(
+                method,
+                Some("active-iframe"),
+                &active_sessions,
+            ));
+            assert!(!is_active_iframe_runtime_event(
+                method,
+                Some("background-iframe"),
+                &active_sessions,
+            ));
+            assert!(!is_active_iframe_runtime_event(
+                method,
+                None,
+                &active_sessions,
+            ));
+        }
+        assert!(!is_active_iframe_runtime_event(
+            "Network.requestWillBeSent",
+            Some("active-iframe"),
             &active_sessions,
         ));
     }

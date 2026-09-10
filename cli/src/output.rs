@@ -2785,7 +2785,8 @@ agent-browser console - View console logs
 
 Usage: agent-browser console [--clear]
 
-View browser console output (log, warn, error, info).
+View browser console output (log, warn, error, info) from the active tab,
+including its out-of-process iframes.
 
 Options:
   --clear              Clear console log buffer
@@ -2805,7 +2806,8 @@ agent-browser errors - View page errors
 
 Usage: agent-browser errors [--clear]
 
-View JavaScript errors and uncaught exceptions.
+View JavaScript errors and uncaught exceptions from the active tab, including
+its out-of-process iframes.
 
 Options:
   --clear              Clear error buffer

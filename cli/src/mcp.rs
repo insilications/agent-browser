@@ -1389,14 +1389,14 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_CONSOLE,
             "Console logs",
-            "Read console logs.",
+            "Read console logs from the active tab and its out-of-process iframes.",
             json!({ "clear": { "type": "boolean" } }),
             &[],
         ),
         tool(
             TOOL_ERRORS,
             "Page errors",
-            "Read page errors.",
+            "Read page errors from the active tab and its out-of-process iframes.",
             json!({ "clear": { "type": "boolean" } }),
             &[],
         ),
