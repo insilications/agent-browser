@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::Shutdown;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -38,6 +38,98 @@ type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEven
 /// Newer events are dropped once it is full; a screencast consumer that
 /// cannot keep up should lose frames, not stall the reader.
 const PRIVATE_SESSION_BUFFER: usize = 16;
+
+/// The default JavaScript world for one frame in one CDP target session.
+/// Execution-context IDs are session-scoped, while `unique_context_id` avoids
+/// accidental reuse across renderer process changes when Chrome provides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultExecutionContext {
+    pub context_id: i64,
+    pub unique_context_id: Option<String>,
+}
+
+type DefaultExecutionContextMap = Arc<RwLock<HashMap<(String, String), DefaultExecutionContext>>>;
+
+fn normalized_session_id(session_id: Option<&str>) -> String {
+    session_id.unwrap_or_default().to_string()
+}
+
+/// Keep the default-world registry beside the CDP reader so context events
+/// cannot be lost merely because a higher-level daemon subscriber is installed
+/// after `Runtime.enable` during browser attachment.
+fn apply_execution_context_event(
+    contexts: &RwLock<HashMap<(String, String), DefaultExecutionContext>>,
+    method: &str,
+    params: &Value,
+    event_session_id: Option<&str>,
+) {
+    let event_session_id = normalized_session_id(event_session_id);
+    let Ok(mut contexts) = contexts.write() else {
+        return;
+    };
+
+    match method {
+        "Runtime.executionContextCreated" => {
+            let Some(context) = params.get("context") else {
+                return;
+            };
+            let is_default = context
+                .get("auxData")
+                .and_then(|aux| aux.get("isDefault"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !is_default {
+                return;
+            }
+            let Some(frame_id) = context
+                .get("auxData")
+                .and_then(|aux| aux.get("frameId"))
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            let Some(context_id) = context.get("id").and_then(Value::as_i64) else {
+                return;
+            };
+            let unique_context_id = context
+                .get("uniqueId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            contexts.insert(
+                (event_session_id, frame_id.to_string()),
+                DefaultExecutionContext {
+                    context_id,
+                    unique_context_id,
+                },
+            );
+        }
+        "Runtime.executionContextDestroyed" => {
+            let context_id = params.get("executionContextId").and_then(Value::as_i64);
+            let unique_context_id = params
+                .get("executionContextUniqueId")
+                .and_then(Value::as_str);
+            contexts.retain(|(session_id, _), context| {
+                if session_id != &event_session_id {
+                    return true;
+                }
+                let id_matches = context_id == Some(context.context_id);
+                let unique_id_matches = unique_context_id.is_some()
+                    && context.unique_context_id.as_deref() == unique_context_id;
+                !id_matches && !unique_id_matches
+            });
+        }
+        "Runtime.executionContextsCleared" => {
+            contexts.retain(|(session_id, _), _| session_id != &event_session_id);
+        }
+        "Target.detachedFromTarget" => {
+            let Some(detached_session_id) = params.get("sessionId").and_then(Value::as_str) else {
+                return;
+            };
+            contexts.retain(|(session_id, _), _| session_id != detached_session_id);
+        }
+        _ => {}
+    }
+}
 
 /// Interval between WebSocket ping frames sent to keep the connection alive
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
@@ -158,6 +250,7 @@ pub struct CdpClient {
     cancel_tx: watch::Sender<bool>,
     next_id: AtomicU64,
     pending: PendingMap,
+    default_execution_contexts: DefaultExecutionContextMap,
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
@@ -251,6 +344,8 @@ impl CdpClient {
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let default_execution_contexts: DefaultExecutionContextMap =
+            Arc::new(RwLock::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
         let closed = Arc::new(AtomicBool::new(false));
@@ -258,6 +353,7 @@ impl CdpClient {
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let pending_clone = pending.clone();
+        let default_execution_contexts_clone = default_execution_contexts.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
         let closed_reader = closed.clone();
@@ -352,9 +448,16 @@ impl CdpClient {
                     }
                 } else if let Some(ref method) = parsed.method {
                     // Event
+                    let params = parsed.params.clone().unwrap_or(Value::Null);
+                    apply_execution_context_event(
+                        &default_execution_contexts_clone,
+                        method,
+                        &params,
+                        parsed.session_id.as_deref(),
+                    );
                     let event = CdpEvent {
                         method: method.clone(),
-                        params: parsed.params.clone().unwrap_or(Value::Null),
+                        params,
                         session_id: parsed.session_id.clone(),
                     };
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
@@ -418,6 +521,7 @@ impl CdpClient {
             cancel_tx,
             next_id: AtomicU64::new(1),
             pending,
+            default_execution_contexts,
             event_tx,
             raw_tx,
             reader_handle: Mutex::new(Some(reader_handle)),
@@ -551,6 +655,20 @@ impl CdpClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id);
+    }
+
+    /// Return the current default page-world context for a frame. The session
+    /// must be the effective renderer target session from `FrameContext`.
+    pub fn default_execution_context(
+        &self,
+        session_id: &str,
+        frame_id: &str,
+    ) -> Option<DefaultExecutionContext> {
+        self.default_execution_contexts
+            .read()
+            .ok()?
+            .get(&(session_id.to_string(), frame_id.to_string()))
+            .cloned()
     }
 
     /// Subscribe to all raw incoming CDP messages (responses + events).
@@ -1064,6 +1182,108 @@ mod tests {
 
         client.close().await;
         server.join().unwrap();
+    }
+
+    #[test]
+    fn default_execution_contexts_follow_session_and_frame_lifecycle() {
+        let contexts = RwLock::new(HashMap::new());
+        apply_execution_context_event(
+            &contexts,
+            "Runtime.executionContextCreated",
+            &json!({
+                "context": {
+                    "id": 7,
+                    "uniqueId": "unique-default-a",
+                    "auxData": { "isDefault": true, "frameId": "frame-a" }
+                }
+            }),
+            Some("session-a"),
+        );
+        apply_execution_context_event(
+            &contexts,
+            "Runtime.executionContextCreated",
+            &json!({
+                "context": {
+                    "id": 8,
+                    "uniqueId": "unique-default-b",
+                    "auxData": { "isDefault": true, "frameId": "frame-b" }
+                }
+            }),
+            Some("session-a"),
+        );
+        apply_execution_context_event(
+            &contexts,
+            "Runtime.executionContextCreated",
+            &json!({
+                "context": {
+                    "id": 9,
+                    "uniqueId": "isolated-b",
+                    "auxData": { "isDefault": false, "frameId": "frame-b" }
+                }
+            }),
+            Some("session-a"),
+        );
+
+        let map = contexts.read().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&("session-a".to_string(), "frame-b".to_string())),
+            Some(&DefaultExecutionContext {
+                context_id: 8,
+                unique_context_id: Some("unique-default-b".to_string()),
+            })
+        );
+        drop(map);
+
+        apply_execution_context_event(
+            &contexts,
+            "Runtime.executionContextDestroyed",
+            &json!({ "executionContextUniqueId": "unique-default-a" }),
+            Some("session-a"),
+        );
+        let map = contexts.read().unwrap();
+        assert!(!map.contains_key(&("session-a".to_string(), "frame-a".to_string())));
+        assert!(map.contains_key(&("session-a".to_string(), "frame-b".to_string())));
+        drop(map);
+
+        apply_execution_context_event(
+            &contexts,
+            "Runtime.executionContextsCleared",
+            &json!({}),
+            Some("session-a"),
+        );
+        assert!(contexts.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn detached_target_clears_only_its_execution_contexts() {
+        let contexts = RwLock::new(HashMap::from([
+            (
+                ("session-a".to_string(), "frame-a".to_string()),
+                DefaultExecutionContext {
+                    context_id: 1,
+                    unique_context_id: None,
+                },
+            ),
+            (
+                ("session-b".to_string(), "frame-b".to_string()),
+                DefaultExecutionContext {
+                    context_id: 2,
+                    unique_context_id: None,
+                },
+            ),
+        ]));
+
+        apply_execution_context_event(
+            &contexts,
+            "Target.detachedFromTarget",
+            &json!({ "sessionId": "session-a" }),
+            None,
+        );
+
+        let map = contexts.read().unwrap();
+        assert!(!map.contains_key(&("session-a".to_string(), "frame-a".to_string())));
+        assert!(map.contains_key(&("session-b".to_string(), "frame-b".to_string())));
     }
 
     #[test]
