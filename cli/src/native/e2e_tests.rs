@@ -1691,7 +1691,7 @@ async fn e2e_tab_close_with_tab_id_closes_active_tab() {
     assert_eq!(get_data(&resp)["title"], "A");
     assert!(state.ref_map.get("e1").is_none());
     assert!(state.iframe_sessions.is_empty());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
@@ -8637,7 +8637,8 @@ async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {
                         "200 OK",
                         "text/html",
                         r#"<!doctype html><html lang="en"><head><title>Outer</title></head>
-<body><main aria-label="Outer"><h1>Outer</h1><img id="outer-image" src="/missing-outer.png">
+<body><script>window.OUTER_REALM = 'outer-main-world';</script>
+<main aria-label="Outer"><h1>Outer</h1><img id="outer-image" src="/missing-outer.png">
 <iframe id="inner" title="Inner" src="/inner"></iframe></main></body></html>"#
                             .to_string(),
                     ),
@@ -8645,7 +8646,12 @@ async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {
                         "200 OK",
                         "text/html",
                         r#"<!doctype html><html lang="en"><head><title>Inner</title></head>
-<body><main aria-label="Inner"><h1>Inner</h1><img id="inner-image" src="/missing-inner.png"></main></body></html>"#
+<body><script>
+window.INNER_REALM = 'inner-main-world';
+setTimeout(() => { window.INNER_READY = true; }, 50);
+</script><main aria-label="Inner"><h1>Inner</h1><div id="inside-b">hello</div>
+<button id="inside-b-button" onclick="document.body.dataset.clicked = 'true'">Click inside B</button>
+<img id="inner-image" src="/missing-inner.png"></main></body></html>"#
                             .to_string(),
                     ),
                     "/siblings" => (
@@ -8703,6 +8709,310 @@ async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {
     });
 
     (port, handle)
+}
+
+/// Frame selection is relative to the selected document, and both refs and
+/// selectors must retain the CDP session that owns their DOM nodes. The
+/// localhost top page embeds a 127.0.0.1 OOPIF whose inner frame stays in the
+/// OOPIF renderer, exercising the inherited-session case that a frame ID alone
+/// cannot represent.
+#[tokio::test]
+#[ignore]
+async fn e2e_frame_selection_preserves_nested_oopif_context() {
+    fn iframe_ref(resp: &Value, name: &str) -> String {
+        get_data(resp)["refs"]
+            .as_object()
+            .and_then(|refs| {
+                refs.iter().find_map(|(ref_id, entry)| {
+                    (entry["role"] == "Iframe" && entry["name"] == name).then(|| ref_id.clone())
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing iframe ref named {name}: {}",
+                    serde_json::to_string_pretty(resp).unwrap_or_default()
+                )
+            })
+    }
+
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--site-per-process"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Same-process top-level frame, first by selector and then by snapshot ref.
+    let same_process_html = r#"<!doctype html><html><head><title>Same-process top</title></head>
+<body><iframe id="same-process" title="Same process" srcdoc="<script>window.SAME_PROCESS_REALM = 'same-main-world';</script><div id='same-process-content'>same</div>"></iframe></body></html>"#;
+    let resp = execute_command(
+        &json!({
+            "id": "same-navigate",
+            "action": "navigate",
+            "url": format!("data:text/html;base64,{}", STANDARD.encode(same_process_html))
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "same-selector", "action": "frame", "selector": "#same-process" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "same-text", "action": "gettext", "selector": "#same-process-content" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "same");
+    let resp = execute_command(
+        &json!({ "id": "same-eval", "action": "evaluate", "script": "window.SAME_PROCESS_REALM" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "same-main-world");
+    assert_success(
+        &execute_command(
+            &json!({ "id": "same-main", "action": "mainframe" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "same-snapshot", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let same_process_ref = iframe_ref(&resp, "Same process");
+    let resp = execute_command(
+        &json!({ "id": "same-ref", "action": "frame", "selector": same_process_ref }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "same-ref-text", "action": "gettext", "selector": "#same-process-content" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "same");
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://localhost:{port}/top")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        !state.iframe_sessions.is_empty(),
+        "fixture must attach the outer frame as an OOPIF"
+    );
+
+    // Selector path: each selector is relative to the currently selected frame.
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "frame", "selector": "#outer" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3-eval", "action": "evaluate", "script": "window.OUTER_REALM" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "outer-main-world");
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "frame", "selector": "#inner" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "gettext", "selector": "#inside-b" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "hello");
+
+    let resp = execute_command(
+        &json!({ "id": "5b", "action": "click", "selector": "#inside-b-button" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "[location.href, document.body.dataset.clicked, window.INNER_REALM]" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["result"][0]
+        .as_str()
+        .is_some_and(|url| url.ends_with("/inner")));
+    assert_eq!(get_data(&resp)["result"][1], "true");
+    assert_eq!(get_data(&resp)["result"][2], "inner-main-world");
+
+    let resp = execute_command(
+        &json!({
+            "id": "6-wait",
+            "action": "waitforfunction",
+            "expression": "window.INNER_READY === true",
+            "timeout": 2_000
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], true);
+
+    let resp = execute_command(
+        &json!({
+            "id": "6-compat-ready",
+            "action": "evaluate",
+            "script": "setTimeout(() => { window.INNER_COMPAT_READY = true; }, 50); true"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "6-compat-wait",
+            "action": "wait",
+            "function": "window.INNER_COMPAT_READY === true",
+            "timeout": 2_000
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["snapshot"]
+        .as_str()
+        .is_some_and(|snapshot| snapshot.contains("Inner")));
+
+    let resp = execute_command(&json!({ "id": "8", "action": "mainframe" }), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "evaluate", "script": "document.title" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "Top");
+
+    // Reload the same-process child from its OOPIF parent. Its frame ID stays
+    // stable while the default execution context is destroyed and recreated.
+    let resp = execute_command(
+        &json!({ "id": "9-outer", "action": "frame", "selector": "#outer" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "9-reload", "action": "evaluate", "script": "document.querySelector('#inner').contentWindow.location.reload(); true" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    let resp = execute_command(
+        &json!({ "id": "9-inner", "action": "frame", "selector": "#inner" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "9-inner-eval", "action": "evaluate", "script": "window.INNER_REALM" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "inner-main-world");
+
+    assert_success(
+        &execute_command(
+            &json!({ "id": "9-main", "action": "mainframe" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    // Ref path: the inner iframe ref is produced by the outer OOPIF session.
+    let resp = execute_command(
+        &json!({ "id": "10", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let outer_ref = iframe_ref(&resp, "Outer");
+    let resp = execute_command(
+        &json!({ "id": "11", "action": "frame", "selector": format!("@{outer_ref}") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "12", "action": "snapshot", "interactive": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let inner_ref = iframe_ref(&resp, "Inner");
+    let resp = execute_command(
+        &json!({ "id": "13", "action": "frame", "selector": inner_ref }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "14", "action": "gettext", "selector": "#inside-b" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["text"], "hello");
+    let resp = execute_command(
+        &json!({ "id": "14-eval", "action": "evaluate", "script": "window.INNER_REALM" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "inner-main-world");
+
+    let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -8844,7 +9154,10 @@ async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {
     state
         .ref_map
         .add("e999".to_string(), Some(999), "button", "stale", None);
-    state.active_frame_id = Some("stale-frame".to_string());
+    state.active_frame = Some(super::element::FrameContext {
+        frame_id: "stale-frame".to_string(),
+        session_id: "stale-session".to_string(),
+    });
     state
         .iframe_sessions
         .insert("stale-frame".to_string(), "stale-session".to_string());
@@ -8861,7 +9174,7 @@ async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {
     .await;
     assert_success(&resp);
     assert!(state.ref_map.get("e999").is_none());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
     assert!(!state.iframe_sessions.contains_key("stale-frame"));
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;

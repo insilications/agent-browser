@@ -25,7 +25,7 @@ use super::cdp::types::{
 };
 use super::cookies;
 use super::diff;
-use super::element::RefMap;
+use super::element::{FrameContext, RefContext, RefMap};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -461,7 +461,10 @@ pub struct DaemonState {
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
     pub tracked_requests: Vec<TrackedRequest>,
     pub request_tracking: bool,
-    pub active_frame_id: Option<String>,
+    /// Selected browsing context together with the renderer target session
+    /// that can execute it. Same-process descendants inherit this session
+    /// from their nearest OOPIF or top-level ancestor.
+    pub active_frame: Option<FrameContext>,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
     /// Entries are retained across tab changes because Chrome does not emit a
@@ -601,7 +604,7 @@ impl DaemonState {
             routes: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
             request_tracking: false,
-            active_frame_id: None,
+            active_frame: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
@@ -2392,7 +2395,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     // Keep element resolution in sync with the `frame` selection (see
     // element::set_active_frame for why this is mirrored).
-    super::element::set_active_frame(state.active_frame_id.as_deref());
+    super::element::set_active_frame(state.active_frame.as_ref());
 
     // `--pin-tab` from the client enables strict tab binding even when the
     // daemon was started without the flag, and `--no-pin-tab` (pinTab: false)
@@ -4892,7 +4895,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
+    state.active_frame = None;
     let result = mgr.navigate(url, wait_until).await?;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
@@ -5041,10 +5044,31 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
         .get("script")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'script' parameter")?;
-
-    let result = mgr.evaluate(script, None).await?;
-    let url = mgr.get_url().await.unwrap_or_default();
-    Ok(json!({ "result": result, "origin": url }))
+    let top_session_id = mgr.active_session_id()?.to_string();
+    let context = super::element::main_world_execution_context(
+        &mgr.client,
+        &top_session_id,
+        state.active_frame.as_ref(),
+    )?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, script, true, true).await?;
+    if let Some(details) = result.exception_details {
+        let message = details
+            .exception
+            .as_ref()
+            .and_then(|exception| exception.description.as_deref())
+            .unwrap_or(&details.text);
+        return Err(format!("Evaluation error: {}", message));
+    }
+    let value = result.result.value.unwrap_or(Value::Null);
+    let origin =
+        super::element::evaluate_in_context(&mgr.client, &context, "location.href", true, false)
+            .await
+            .ok()
+            .and_then(|result| result.result.value)
+            .and_then(|value| value.as_str().map(ToString::to_string))
+            .unwrap_or_default();
+    Ok(json!({ "result": value, "origin": origin }))
 }
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
@@ -5120,7 +5144,14 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &session_id,
         &options,
         &mut state.ref_map,
-        state.active_frame_id.as_deref(),
+        state
+            .active_frame
+            .as_ref()
+            .map(|frame| frame.frame_id.as_str()),
+        state
+            .active_frame
+            .as_ref()
+            .map(|frame| frame.session_id.as_str()),
         &state.iframe_sessions,
     )
     .await?;
@@ -5226,7 +5257,14 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
                 ..SnapshotOptions::default()
             },
             &mut state.ref_map,
-            state.active_frame_id.as_deref(),
+            state
+                .active_frame
+                .as_ref()
+                .map(|frame| frame.frame_id.as_str()),
+            state
+                .active_frame
+                .as_ref()
+                .map(|frame| frame.session_id.as_str()),
             &state.iframe_sessions,
         )
         .await?;
@@ -5442,7 +5480,12 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
 async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let top_session_id = mgr.active_session_id()?.to_string();
+    let session_id = state
+        .active_frame
+        .as_ref()
+        .map(|frame| frame.session_id.as_str())
+        .unwrap_or(&top_session_id);
     let key = cmd
         .get("key")
         .and_then(|v| v.as_str())
@@ -5451,7 +5494,7 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     // Parse modifier+key chords like "Control+a", "Shift+Enter", "Control+Shift+a"
     let (actual_key, modifiers) = parse_key_chord(key);
 
-    interaction::press_key_with_modifiers(&mgr.client, &session_id, &actual_key, modifiers).await?;
+    interaction::press_key_with_modifiers(&mgr.client, session_id, &actual_key, modifiers).await?;
     Ok(json!({ "pressed": key }))
 }
 
@@ -5535,16 +5578,33 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
-    interaction::scroll(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        dx,
-        dy,
-        &state.iframe_sessions,
-    )
-    .await?;
+    if selector.is_none() && state.active_frame.is_some() {
+        let context = super::element::frame_execution_context(
+            &mgr.client,
+            &session_id,
+            state.active_frame.as_ref(),
+        )
+        .await?;
+        super::element::evaluate_in_context(
+            &mgr.client,
+            &context,
+            &format!("window.scrollBy({}, {})", dx, dy),
+            true,
+            false,
+        )
+        .await?;
+    } else {
+        interaction::scroll(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            dx,
+            dy,
+            &state.iframe_sessions,
+        )
+        .await?;
+    }
     Ok(json!({ "scrolled": true }))
 }
 
@@ -5625,7 +5685,18 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let timeout_ms = state.timeout_ms(cmd);
 
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
-        wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
+        let expression = format!(
+            "(document.body.innerText || '').includes({})",
+            serde_json::to_string(text).unwrap_or_default()
+        );
+        poll_until_true_in_frame(
+            &mgr.client,
+            &session_id,
+            state.active_frame.as_ref(),
+            &expression,
+            timeout_ms,
+        )
+        .await?;
         return Ok(json!({ "waited": "text", "text": text }));
     }
 
@@ -5634,29 +5705,15 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
             .get("state")
             .and_then(|v| v.as_str())
             .unwrap_or("visible");
-        // Honor an active `frame <sel>` selection, like element resolution does.
-        match state.active_frame_id.as_deref() {
-            Some(frame_id) => match state.iframe_sessions.get(frame_id) {
-                Some(frame_session) => {
-                    wait_for_selector(&mgr.client, frame_session, selector, state_str, timeout_ms)
-                        .await?
-                }
-                None => {
-                    wait_for_selector_in_frame(
-                        &mgr.client,
-                        &session_id,
-                        frame_id,
-                        selector,
-                        state_str,
-                        timeout_ms,
-                    )
-                    .await?
-                }
-            },
-            None => {
-                wait_for_selector(&mgr.client, &session_id, selector, state_str, timeout_ms).await?
-            }
-        }
+        wait_for_selector_in_frame(
+            &mgr.client,
+            &session_id,
+            state.active_frame.as_ref(),
+            selector,
+            state_str,
+            timeout_ms,
+        )
+        .await?;
         return Ok(json!({ "waited": "selector", "selector": selector }));
     }
 
@@ -5666,7 +5723,14 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     }
 
     if let Some(fn_str) = cmd.get("function").and_then(|v| v.as_str()) {
-        wait_for_function(&mgr.client, &session_id, fn_str, timeout_ms).await?;
+        poll_until_true_in_main_world(
+            &mgr.client,
+            &session_id,
+            state.active_frame.as_ref(),
+            &format!("!!({})", fn_str),
+            timeout_ms,
+        )
+        .await?;
         return Ok(json!({ "waited": "function" }));
     }
 
@@ -5947,61 +6011,121 @@ async fn wait_for_function(
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
 }
 
-/// wait_for_selector inside a same-process iframe selected via `frame <sel>`:
-/// polls through the owner element's contentDocument, which stays correct
-/// even if the frame navigates (the getter re-resolves every poll).
 async fn wait_for_selector_in_frame(
     client: &super::cdp::client::CdpClient,
-    session_id: &str,
-    frame_id: &str,
+    top_session_id: &str,
+    frame: Option<&FrameContext>,
     selector: &str,
     state: &str,
     timeout_ms: u64,
 ) -> Result<(), String> {
-    let owner_object_id =
-        super::element::frame_owner_object_id(client, session_id, frame_id).await?;
     let sel = serde_json::to_string(selector).unwrap_or_default();
-    let check = match state {
-        "attached" => format!("!!doc.querySelector({sel})"),
-        "detached" => format!("!doc.querySelector({sel})"),
+    let expression = match state {
+        "attached" => format!("!!document.querySelector({sel})"),
+        "detached" => format!("!document.querySelector({sel})"),
         "hidden" => format!(
             r#"(() => {{
-                const el = doc.querySelector({sel});
+                const el = document.querySelector({sel});
                 if (!el) return true;
-                const s = doc.defaultView.getComputedStyle(el);
+                const s = window.getComputedStyle(el);
                 return s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0;
             }})()"#,
         ),
         _ => format!(
             r#"(() => {{
-                const el = doc.querySelector({sel});
+                const el = document.querySelector({sel});
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
-                const s = doc.defaultView.getComputedStyle(el);
+                const s = window.getComputedStyle(el);
                 return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
             }})()"#,
         ),
     };
-    let function = format!(
-        "function() {{ const doc = this.contentDocument; if (!doc) return false; return {check}; }}",
-    );
+    poll_until_true_in_frame(client, top_session_id, frame, &expression, timeout_ms).await
+}
+
+async fn poll_until_true_in_frame(
+    client: &super::cdp::client::CdpClient,
+    top_session_id: &str,
+    frame: Option<&FrameContext>,
+    expression: &str,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let context = super::element::frame_execution_context(client, top_session_id, frame).await?;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     loop {
-        let result = client
-            .send_command(
-                "Runtime.callFunctionOn",
-                Some(json!({
-                    "objectId": owner_object_id,
-                    "functionDeclaration": function,
-                    "returnByValue": true,
-                })),
-                Some(session_id),
-            )
-            .await?;
+        let result =
+            super::element::evaluate_in_context(client, &context, expression, true, true).await?;
         let satisfied = result
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_bool())
+            .result
+            .value
+            .as_ref()
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if satisfied {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Wait timed out after {}ms", timeout_ms));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn is_transient_execution_context_error(error: &str) -> bool {
+    error.contains("Cannot find context with specified")
+        || error.contains("Execution context was destroyed")
+        || error.contains("Inspected target navigated or closed")
+}
+
+/// Poll user-authored JavaScript in the document's default world. Resolve the
+/// context again on each pass because navigation replaces default execution
+/// contexts even when the frame ID remains stable.
+async fn poll_until_true_in_main_world(
+    client: &super::cdp::client::CdpClient,
+    top_session_id: &str,
+    frame: Option<&FrameContext>,
+    expression: &str,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    loop {
+        let context =
+            match super::element::main_world_execution_context(client, top_session_id, frame) {
+                Ok(context) => context,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(_) => return Err(format!("Wait timed out after {}ms", timeout_ms)),
+            };
+        let result =
+            match super::element::evaluate_in_context(client, &context, expression, true, true)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) if is_transient_execution_context_error(&error) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(format!("Wait timed out after {}ms", timeout_ms));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        if let Some(details) = result.exception_details {
+            let message = details
+                .exception
+                .as_ref()
+                .and_then(|exception| exception.description.as_deref())
+                .unwrap_or(&details.text);
+            return Err(format!("Evaluation error: {}", message));
+        }
+        let satisfied = result
+            .result
+            .value
+            .as_ref()
+            .and_then(Value::as_bool)
             .unwrap_or(false);
         if satisfied {
             return Ok(());
@@ -6290,7 +6414,14 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         &session_id,
         &options,
         &mut current_ref_map,
-        state.active_frame_id.as_deref(),
+        state
+            .active_frame
+            .as_ref()
+            .map(|frame| frame.frame_id.as_str()),
+        state
+            .active_frame
+            .as_ref()
+            .map(|frame| frame.session_id.as_str()),
         &state.iframe_sessions,
     )
     .await?;
@@ -6357,6 +6488,7 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &options,
         &mut snap1_ref_map,
         None,
+        None,
         &state.iframe_sessions,
     )
     .await?;
@@ -6370,6 +6502,7 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &session_id,
         &options,
         &mut snap2_ref_map,
+        None,
         None,
         &state.iframe_sessions,
     )
@@ -6538,7 +6671,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
+    state.active_frame = None;
     state.webmcp.clear_invocations();
     let mut result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -6594,7 +6727,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     // the user on the old tab with dead refs and frame scope.
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
+    state.active_frame = None;
     state.webmcp.clear_invocations();
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
@@ -6653,7 +6786,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.webmcp.clear_invocations();
-    state.active_frame_id = None;
+    state.active_frame = None;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
 }
@@ -8680,20 +8813,28 @@ async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Valu
         .ok_or("Missing 'expression' parameter")?;
     let timeout_ms = state.timeout_ms(cmd);
 
-    wait_for_function(&mgr.client, &session_id, expression, timeout_ms).await?;
+    poll_until_true_in_main_world(
+        &mgr.client,
+        &session_id,
+        state.active_frame.as_ref(),
+        &format!("!!({})", expression),
+        timeout_ms,
+    )
+    .await?;
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: format!("({})", expression),
-                return_by_value: Some(true),
-                await_promise: Some(true),
-            },
-            Some(&session_id),
-        )
-        .await?;
+    let context = super::element::main_world_execution_context(
+        &mgr.client,
+        &session_id,
+        state.active_frame.as_ref(),
+    )?;
+    let result = super::element::evaluate_in_context(
+        &mgr.client,
+        &context,
+        &format!("({})", expression),
+        true,
+        true,
+    )
+    .await?;
 
     Ok(json!({ "result": result.result.value.unwrap_or(Value::Null) }))
 }
@@ -8702,9 +8843,62 @@ async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Valu
 // Frame handlers
 // ---------------------------------------------------------------------------
 
+fn selected_frame_from_node(
+    describe: &Value,
+    source_session_id: &str,
+    iframe_sessions: &HashMap<String, String>,
+    fallback_label: &str,
+) -> Result<(FrameContext, String), String> {
+    let node = describe
+        .get("node")
+        .ok_or("Could not resolve iframe element")?;
+    let node_name = node.get("nodeName").and_then(Value::as_str).unwrap_or("");
+    if node_name != "IFRAME" && node_name != "FRAME" {
+        return Err("Selected element is not an iframe".to_string());
+    }
+
+    let frame_id = node
+        .get("contentDocument")
+        .and_then(|document| document.get("frameId"))
+        .and_then(Value::as_str)
+        .or_else(|| node.get("frameId").and_then(Value::as_str))
+        .ok_or("Could not resolve frame ID for iframe element")?;
+    let session_id = iframe_sessions
+        .get(frame_id)
+        .cloned()
+        .unwrap_or_else(|| source_session_id.to_string());
+
+    let attributes = node
+        .get("attributes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let attribute = |name: &str| {
+        attributes
+            .iter()
+            .enumerate()
+            .find(|(_, value)| value.as_str() == Some(name))
+            .and_then(|(index, _)| attributes.get(index + 1))
+            .and_then(Value::as_str)
+    };
+    let label = attribute("name")
+        .or_else(|| attribute("id"))
+        .or_else(|| attribute("title"))
+        .unwrap_or(fallback_label)
+        .to_string();
+
+    Ok((
+        FrameContext {
+            frame_id: frame_id.to_string(),
+            session_id,
+        },
+        label,
+    ))
+}
+
 async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let top_session_id = mgr.active_session_id()?.to_string();
 
     let selector = cmd.get("selector").and_then(|v| v.as_str());
     let name = cmd.get("name").and_then(|v| v.as_str());
@@ -8713,11 +8907,6 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     if selector.is_none() && name.is_none() && url.is_none() {
         return Err("At least one of 'selector', 'name', or 'url' is required".to_string());
     }
-
-    let tree_result = mgr
-        .client
-        .send_command_no_params("Page.getFrameTree", Some(&session_id))
-        .await?;
 
     fn find_frame(tree: &Value, name: Option<&str>, url: Option<&str>) -> Option<String> {
         let frame = tree.get("frame")?;
@@ -8746,9 +8935,6 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         None
     }
 
-    let frame_tree = &tree_result["frameTree"];
-
-    // If selector is a ref (@e1), resolve the iframe element from the ref map
     if let Some(sel) = selector {
         if let Some(ref_id) = super::element::parse_ref(sel) {
             let entry = state
@@ -8758,93 +8944,119 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             let backend_node_id = entry
                 .backend_node_id
                 .ok_or_else(|| format!("Ref {} has no backend node id", ref_id))?;
-
-            // Use DOM.describeNode to resolve the child frame ID directly.
-            // This works reliably for all iframes, including those without
-            // name, id, or src attributes.
+            let source_session_id = entry
+                .session_id
+                .clone()
+                .or_else(|| {
+                    entry
+                        .frame_id
+                        .as_ref()
+                        .and_then(|frame_id| state.iframe_sessions.get(frame_id).cloned())
+                })
+                .unwrap_or_else(|| top_session_id.clone());
             let describe: Value = mgr
                 .client
                 .send_command(
                     "DOM.describeNode",
                     Some(json!({ "backendNodeId": backend_node_id, "depth": 1 })),
-                    Some(&session_id),
+                    Some(&source_session_id),
                 )
                 .await?;
-
-            // Verify this is an iframe/frame element
-            let node_name = describe
-                .get("node")
-                .and_then(|n| n.get("nodeName"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if node_name != "IFRAME" && node_name != "FRAME" {
-                return Err("Ref does not point to an iframe element".to_string());
-            }
-
-            // Try contentDocument.frameId first (standard for iframes)
-            let frame_id = describe
-                .get("node")
-                .and_then(|n| n.get("contentDocument"))
-                .and_then(|cd| cd.get("frameId"))
-                .and_then(|v| v.as_str())
-                // Fallback: the node itself may carry a frameId
-                .or_else(|| {
-                    describe
-                        .get("node")
-                        .and_then(|n| n.get("frameId"))
-                        .and_then(|v| v.as_str())
-                })
-                .ok_or("Could not resolve frame ID for iframe element")?;
-
-            let label = describe
-                .get("node")
-                .and_then(|n| n.get("attributes"))
-                .and_then(|a| a.as_array())
-                .and_then(|attrs| {
-                    attrs
-                        .iter()
-                        .enumerate()
-                        .find(|(_, v)| v.as_str() == Some("name"))
-                        .and_then(|(i, _)| attrs.get(i + 1))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or(&ref_id);
-
-            state.active_frame_id = Some(frame_id.to_string());
+            let (frame, label) = selected_frame_from_node(
+                &describe,
+                &source_session_id,
+                &state.iframe_sessions,
+                &ref_id,
+            )?;
+            state.active_frame = Some(frame);
             return Ok(json!({ "frame": label }));
         }
 
-        // CSS selector path
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector({});
-                if (!el) return null;
-                if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {{
-                    return el.name || el.id || el.src || null;
-                }}
-                return null;
-            }})()"#,
+        let expression = format!(
+            "document.querySelector({})",
             serde_json::to_string(sel).unwrap_or_default()
         );
-        let result = mgr.evaluate(&js, None).await?;
-        let frame_name = result.as_str().ok_or("Could not find frame for selector")?;
-        if let Some(frame_id) = find_frame(frame_tree, Some(frame_name), None) {
-            state.active_frame_id = Some(frame_id);
-            return Ok(json!({ "frame": frame_name }));
+        let execution_context = super::element::frame_execution_context(
+            &mgr.client,
+            &top_session_id,
+            state.active_frame.as_ref(),
+        )
+        .await?;
+        let result = super::element::evaluate_in_context(
+            &mgr.client,
+            &execution_context,
+            &expression,
+            false,
+            false,
+        )
+        .await?;
+        if let Some(details) = result.exception_details {
+            let message = details
+                .exception
+                .as_ref()
+                .and_then(|exception| exception.description.as_deref())
+                .unwrap_or(&details.text);
+            return Err(format!("Invalid frame selector '{}': {}", sel, message));
         }
+        let object_id = result
+            .result
+            .object_id
+            .ok_or("Could not find frame for selector")?;
+        let describe = mgr
+            .client
+            .send_command(
+                "DOM.describeNode",
+                Some(json!({ "objectId": object_id, "depth": 1 })),
+                Some(&execution_context.session_id),
+            )
+            .await?;
+        let (frame, label) = selected_frame_from_node(
+            &describe,
+            &execution_context.session_id,
+            &state.iframe_sessions,
+            sel,
+        )?;
+        state.active_frame = Some(frame);
+        return Ok(json!({ "frame": label }));
     }
 
-    if let Some(frame_id) = find_frame(frame_tree, name, url) {
-        let label = name.or(url).unwrap_or("frame");
-        state.active_frame_id = Some(frame_id);
-        return Ok(json!({ "frame": label }));
+    // Legacy daemon callers can select by frame name or URL. Search attached
+    // iframe targets before the top target because their trees are the
+    // authoritative source for same-process descendants below an OOPIF.
+    let mut sessions = state
+        .active_iframe_sessions
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    sessions.push(top_session_id.clone());
+    for source_session_id in sessions {
+        let Ok(tree_result) = mgr
+            .client
+            .send_command_no_params("Page.getFrameTree", Some(&source_session_id))
+            .await
+        else {
+            continue;
+        };
+        if let Some(frame_id) = find_frame(&tree_result["frameTree"], name, url) {
+            let session_id = state
+                .iframe_sessions
+                .get(&frame_id)
+                .cloned()
+                .unwrap_or(source_session_id);
+            state.active_frame = Some(FrameContext {
+                frame_id,
+                session_id,
+            });
+            return Ok(json!({ "frame": name.or(url).unwrap_or("frame") }));
+        }
     }
 
     Err("Frame not found".to_string())
 }
 
 async fn handle_mainframe(state: &mut DaemonState) -> Result<Value, String> {
-    state.active_frame_id = None;
+    state.active_frame = None;
     Ok(json!({ "frame": "main" }))
 }
 
@@ -9093,14 +9305,8 @@ async fn handle_presentational_getbyrole(
     let located = {
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
         let top_session = mgr.active_session_id()?.to_string();
-        eval_body_in_active_frame(
-            mgr,
-            state.active_frame_id.as_deref(),
-            &top_session,
-            &state.iframe_sessions,
-            &locate_body,
-        )
-        .await?
+        eval_body_in_active_frame(mgr, &top_session, state.active_frame.as_ref(), &locate_body)
+            .await?
     };
 
     if !located.as_bool().unwrap_or(false) {
@@ -9119,9 +9325,8 @@ async fn handle_presentational_getbyrole(
             let top_session = top_session.to_string();
             let _ = eval_body_in_active_frame(
                 mgr,
-                state.active_frame_id.as_deref(),
                 &top_session,
-                &state.iframe_sessions,
+                state.active_frame.as_ref(),
                 "(root) => { root.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located'); }",
             )
             .await;
@@ -9132,62 +9337,23 @@ async fn handle_presentational_getbyrole(
 }
 
 /// Evaluate a `(root) => {...}` body against the active frame's document, or the
-/// top document when no frame is selected. Runtime.evaluate cannot target a
-/// same-origin child frame, so that case runs the body against the frame owner's
-/// contentDocument (as element resolution does); an OOPIF has its own session
-/// where `document` is already the frame document.
+/// top document when no frame is selected.
 async fn eval_body_in_active_frame(
     mgr: &BrowserManager,
-    frame_id: Option<&str>,
     top_session: &str,
-    iframe_sessions: &HashMap<String, String>,
+    frame: Option<&FrameContext>,
     body: &str,
 ) -> Result<Value, String> {
-    match frame_id {
-        Some(fid) if !iframe_sessions.contains_key(fid) => {
-            let owner =
-                super::element::frame_owner_object_id(&mgr.client, top_session, fid).await?;
-            let func = format!(
-                "function() {{ const d = this.contentDocument; if (!d) return null; return ({body})(d); }}"
-            );
-            let res = mgr
-                .client
-                .send_command(
-                    "Runtime.callFunctionOn",
-                    Some(serde_json::json!({
-                        "objectId": owner,
-                        "functionDeclaration": func,
-                        "returnByValue": true,
-                    })),
-                    Some(top_session),
-                )
-                .await?;
-            Ok(res
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .cloned()
-                .unwrap_or(Value::Null))
-        }
-        _ => {
-            let session = frame_id
-                .and_then(|f| iframe_sessions.get(f))
-                .map(|s| s.as_str())
-                .unwrap_or(top_session);
-            let res: super::cdp::types::EvaluateResult = mgr
-                .client
-                .send_command_typed(
-                    "Runtime.evaluate",
-                    &super::cdp::types::EvaluateParams {
-                        expression: format!("({body})(document)"),
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session),
-                )
-                .await?;
-            Ok(res.result.value.unwrap_or(Value::Null))
-        }
-    }
+    let context = super::element::frame_execution_context(&mgr.client, top_session, frame).await?;
+    let result = super::element::evaluate_in_context(
+        &mgr.client,
+        &context,
+        &format!("({body})(document)"),
+        true,
+        false,
+    )
+    .await?;
+    Ok(result.result.value.unwrap_or(Value::Null))
 }
 
 async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -9211,7 +9377,14 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     // authoritative source for implicit roles (e.g. <h2> -> "heading",
     // <a href> -> "link"), which a CSS selector cannot approximate.
     let (ax_params, effective_session_id) = super::element::resolve_ax_session(
-        state.active_frame_id.as_deref(),
+        state
+            .active_frame
+            .as_ref()
+            .map(|frame| frame.frame_id.as_str()),
+        state
+            .active_frame
+            .as_ref()
+            .map(|frame| frame.session_id.as_str()),
         &session_id,
         &state.iframe_sessions,
     );
@@ -9235,7 +9408,13 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         role,
         &actual_name,
         None,
-        state.active_frame_id.as_deref(),
+        RefContext {
+            frame_id: state
+                .active_frame
+                .as_ref()
+                .map(|frame| frame.frame_id.as_str()),
+            session_id: Some(effective_session_id),
+        },
     );
     state.ref_map.set_next_ref_num(ref_num + 1);
 
@@ -9478,18 +9657,14 @@ async fn handle_semantic_locator(
         }
     };
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: query,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&session_id),
-        )
-        .await?;
+    let context = super::element::frame_execution_context(
+        &mgr.client,
+        &session_id,
+        state.active_frame.as_ref(),
+    )
+    .await?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, &query, true, false).await?;
 
     if !result
         .result
@@ -9505,12 +9680,14 @@ async fn handle_semantic_locator(
     let action_result = execute_subaction(cmd, state, selector).await;
 
     if let Some(ref browser) = state.browser {
-        let _ = browser
-            .evaluate(
-                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
-                None,
-            )
-            .await;
+        let _ = super::element::evaluate_in_context(
+            &browser.client,
+            &context,
+            "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+            true,
+            false,
+        )
+        .await;
     }
 
     action_result
@@ -9564,18 +9741,14 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
         idx = index,
     );
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: js,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&session_id),
-        )
-        .await?;
+    let context = super::element::frame_execution_context(
+        &mgr.client,
+        &session_id,
+        state.active_frame.as_ref(),
+    )
+    .await?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, &js, true, false).await?;
 
     if !result
         .result
@@ -9594,12 +9767,14 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     let action_result = execute_subaction(cmd, state, located).await;
 
     if let Some(ref browser) = state.browser {
-        let _ = browser
-            .evaluate(
-                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
-                None,
-            )
-            .await;
+        let _ = super::element::evaluate_in_context(
+            &browser.client,
+            &context,
+            "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+            true,
+            false,
+        )
+        .await;
     }
 
     action_result
@@ -9607,6 +9782,7 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
 
 async fn handle_find(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -9625,8 +9801,18 @@ async fn handle_find(cmd: &Value, state: &DaemonState) -> Result<Value, String> 
         serde_json::to_string(selector).unwrap_or_default()
     );
 
-    let result = mgr.evaluate(&js, None).await?;
-    Ok(json!({ "elements": result, "selector": selector }))
+    let context = super::element::frame_execution_context(
+        &mgr.client,
+        &session_id,
+        state.active_frame.as_ref(),
+    )
+    .await?;
+    let result =
+        super::element::evaluate_in_context(&mgr.client, &context, &js, true, false).await?;
+    Ok(json!({
+        "elements": result.result.value.unwrap_or(Value::Null),
+        "selector": selector
+    }))
 }
 
 async fn handle_evalhandle(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
