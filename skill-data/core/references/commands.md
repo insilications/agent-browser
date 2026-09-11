@@ -270,6 +270,10 @@ Selection is relative to the current frame. After entering one iframe, the next 
 
 `eval` and `wait --fn` run in the current frame's page world, so application globals defined by that frame are visible. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
 
+Frame selection follows the same frame ID across renderer changes, including transitions into or out of an out-of-process iframe. Before a frame-dependent command starts, agent-browser waits for that frame's renderer and page context within the existing command timeout. Recovery does not replay a started command or follow renderer changes inside an already-running wait. Replaced documents invalidate their element refs; take a new snapshot before using refs in the new document.
+
+If the selected frame or an ancestor is removed, frame-dependent commands and keyboard input fail with `frame_gone`: "Selected frame is no longer available. Run `frame main` or select the frame again." A replacement iframe with identical attributes does not restore the old selection. Use `frame main`, then select the iframe and take a new snapshot. A valid surviving iframe-element ref can also select a frame explicitly. If renderer preparation times out without confirmed removal, the error code is `frame_not_ready`; retry the command or use `frame main`. JSON output and MCP responses preserve these codes.
+
 ## Dialogs
 
 By default, `alert` and `beforeunload` dialogs are automatically accepted so they never block the agent. `confirm` and `prompt` dialogs still require explicit handling. Use `--no-auto-dialog` to disable this behavior.

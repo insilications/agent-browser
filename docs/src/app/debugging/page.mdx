@@ -30,6 +30,18 @@ Use `console --json` when object previews or raw CDP arguments matter for an aut
 
 Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. Events from OOPIFs belonging to background tabs are excluded.
 
+## Selected frame recovery
+
+Frame-dependent commands and keyboard input fail with `frame_gone` when the selected frame or an ancestor has been removed. The message is: "Selected frame is no longer available. Run `frame main` or select the frame again." The selection stays invalid until explicit recovery, so input cannot silently reach the main document.
+
+```bash
+agent-browser frame main
+agent-browser frame "#embed-iframe"
+agent-browser snapshot -i
+```
+
+For a surviving frame that changes renderer, the next command resolves its current session before dispatch. Preparation uses the existing command timeout. A `frame_not_ready` error means preparation timed out without confirmed removal; retry the command or return to `frame main`. Both codes are preserved in JSON and MCP responses. Console, errors, tab management, and explicit top-level navigation remain available for recovery. Renderer changes during an already-running wait are outside this recovery behavior.
+
 ## JavaScript dialogs
 
 ```bash

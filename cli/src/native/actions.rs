@@ -26,6 +26,7 @@ use super::cdp::types::{
 use super::cookies;
 use super::diff;
 use super::element::{FrameContext, RefContext, RefMap};
+use super::frame::{self, SelectedFrameState, SelectionStatus};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -214,6 +215,7 @@ pub struct MouseState {
 
 #[derive(Default)]
 struct DrainedEvents {
+    frame_lifecycle: Vec<CdpEvent>,
     pending_acks: Vec<i64>,
     new_targets: Vec<TargetCreatedEvent>,
     changed_targets: Vec<TargetInfoChangedEvent>,
@@ -476,6 +478,7 @@ pub struct DaemonState {
     /// that can execute it. Same-process descendants inherit this session
     /// from their nearest OOPIF or top-level ancestor.
     pub active_frame: Option<FrameContext>,
+    selected_frame_state: SelectedFrameState,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
     /// Entries are retained across tab changes because Chrome does not emit a
@@ -616,6 +619,7 @@ impl DaemonState {
             tracked_requests: Vec::new(),
             request_tracking: false,
             active_frame: None,
+            selected_frame_state: SelectedFrameState::default(),
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
@@ -1018,6 +1022,183 @@ impl DaemonState {
         self.apply_drained_events(drained).await
     }
 
+    fn reset_frame_selection(&mut self) {
+        self.active_frame = None;
+        self.selected_frame_state = SelectedFrameState::default();
+        super::element::set_active_frame(None);
+    }
+
+    async fn select_frame(&mut self, frame: FrameContext) -> Result<(), String> {
+        let mgr = self.browser.as_ref().ok_or("Browser not launched")?;
+        let topology = frame::collect_frame_topology(
+            &mgr.client,
+            mgr.active_session_id()?,
+            &self.iframe_sessions,
+        )
+        .await?;
+        // A surviving parent-side ref can recover a selection, but describing
+        // a detached iframe node must not revive its departed browsing context.
+        let target = topology.frames.get(&frame.frame_id).ok_or_else(|| {
+            if topology.incomplete {
+                frame::FRAME_NOT_READY
+            } else {
+                frame::FRAME_GONE
+            }
+            .to_string()
+        })?;
+        let ready = mgr
+            .client
+            .default_execution_context(&target.session_id, &target.frame_id)
+            .is_some();
+        self.active_frame = Some(FrameContext {
+            frame_id: target.frame_id.clone(),
+            session_id: target.session_id.clone(),
+        });
+        self.selected_frame_state = SelectedFrameState {
+            status: if ready {
+                SelectionStatus::Ready
+            } else {
+                SelectionStatus::Pending
+            },
+            topology: Some(topology),
+            revision: 0,
+        };
+        super::element::set_active_frame(self.active_frame.as_ref());
+        Ok(())
+    }
+
+    /// Resolve the same browsing context, never a selector or replacement node.
+    /// Returns authoritative absence separately from incomplete target queries.
+    async fn refresh_selected_frame(&mut self) -> Result<bool, String> {
+        let Some(selected) = self.active_frame.clone() else {
+            return Ok(false);
+        };
+        if self.selected_frame_state.status == SelectionStatus::Removed {
+            return Err(frame::FRAME_GONE.to_string());
+        }
+        let mgr = self.browser.as_ref().ok_or("Browser not launched")?;
+        let topology = frame::collect_frame_topology(
+            &mgr.client,
+            mgr.active_session_id()?,
+            &self.iframe_sessions,
+        )
+        .await?;
+        let Some(target) = topology.frames.get(&selected.frame_id) else {
+            self.selected_frame_state.status = SelectionStatus::Pending;
+            // Keep the last known ancestry for a subsequent removal event.
+            return Ok(!topology.incomplete);
+        };
+        let old_loader = self
+            .selected_frame_state
+            .topology
+            .as_ref()
+            .and_then(|t| t.frames.get(&selected.frame_id))
+            .and_then(|f| f.loader_id.as_ref());
+        if selected.session_id != target.session_id
+            || old_loader.is_some() && old_loader != target.loader_id.as_ref()
+        {
+            self.selected_frame_state
+                .invalidate_document(&mut self.ref_map, &selected.frame_id);
+        }
+        let ready = mgr
+            .client
+            .default_execution_context(&target.session_id, &target.frame_id)
+            .is_some();
+        self.active_frame = Some(FrameContext {
+            frame_id: target.frame_id.clone(),
+            session_id: target.session_id.clone(),
+        });
+        self.selected_frame_state.status = if ready {
+            SelectionStatus::Ready
+        } else {
+            SelectionStatus::Pending
+        };
+        self.selected_frame_state.topology = Some(topology);
+        Ok(false)
+    }
+
+    /// Only preparation is retried. Once dispatch begins, no action is replayed.
+    async fn reconcile_selected_frame(&mut self, timeout_ms: u64) -> Result<(), String> {
+        if self.active_frame.is_none() {
+            return Ok(());
+        }
+        self.browser
+            .as_ref()
+            .ok_or("Browser not launched")?
+            .active_session_id()?;
+        if timeout_ms == 0 {
+            if self.selected_frame_state.status == SelectionStatus::Removed {
+                return Err(frame::FRAME_GONE.to_string());
+            }
+            let selected = self.active_frame.as_ref().unwrap();
+            // Zero performs a synchronous check of the last resolved ownership
+            // and the reader's live context registry, never a blocking query.
+            let ready = self.selected_frame_state.status == SelectionStatus::Ready
+                && self
+                    .browser
+                    .as_ref()
+                    .unwrap()
+                    .client
+                    .default_execution_context(&selected.session_id, &selected.frame_id)
+                    .is_some();
+            return if ready {
+                Ok(())
+            } else {
+                Err(frame::FRAME_NOT_READY.to_string())
+            };
+        }
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+        let mut last_absence = (false, self.selected_frame_state.revision);
+        loop {
+            if self.selected_frame_state.status == SelectionStatus::Removed {
+                return Err(frame::FRAME_GONE.to_string());
+            }
+            // Bound ownership queries and polling. A failed query never
+            // proves that a frame was removed.
+            // Finish domain setup and resuming paused targets even if the
+            // deadline expires; cancelling that mutation could strand a target.
+            self.drain_cdp_events_background().await?;
+            if self.selected_frame_state.status == SelectionStatus::Removed {
+                return Err(frame::FRAME_GONE.to_string());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.expired_frame_preparation(
+                    last_absence.0 && last_absence.1 == self.selected_frame_state.revision,
+                ));
+            }
+            self.selected_frame_state.status = SelectionStatus::Pending;
+            let absent =
+                match tokio::time::timeout_at(deadline, self.refresh_selected_frame()).await {
+                    Ok(Ok(absent)) => absent,
+                    Ok(Err(error)) if error == frame::FRAME_GONE => return Err(error),
+                    _ => false,
+                };
+            last_absence = (absent, self.selected_frame_state.revision);
+            if self.selected_frame_state.status == SelectionStatus::Ready {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.expired_frame_preparation(absent));
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + tokio::time::Duration::from_millis(25)),
+            )
+            .await;
+        }
+    }
+
+    fn expired_frame_preparation(&mut self, absent: bool) -> String {
+        if absent {
+            self.selected_frame_state.status = SelectionStatus::Removed;
+            let id = &self.active_frame.as_ref().unwrap().frame_id;
+            self.selected_frame_state
+                .invalidate_document(&mut self.ref_map, id);
+            frame::FRAME_GONE.to_string()
+        } else {
+            frame::FRAME_NOT_READY.to_string()
+        }
+    }
+
     async fn refresh_active_iframe_sessions(&mut self) {
         let Some(ref browser) = self.browser else {
             self.active_iframe_sessions.clear();
@@ -1041,6 +1222,12 @@ impl DaemonState {
     }
 
     async fn apply_drained_events(&mut self, drained: DrainedEvents) -> Result<(), String> {
+        if let Some(selected) = &mut self.active_frame {
+            for event in &drained.frame_lifecycle {
+                self.selected_frame_state
+                    .apply_event(selected, &mut self.ref_map, event);
+            }
+        }
         // Popups and externally closed pages can change the active top-level
         // target without changing iframe topology. Refresh after either kind
         // of event so page-wide diagnostics stay scoped to the active page.
@@ -1403,6 +1590,7 @@ impl DaemonState {
             None => return DrainedEvents::default(),
         };
 
+        let mut frame_lifecycle = Vec::new();
         let mut pending_acks: Vec<i64> = Vec::new();
         let mut new_targets: Vec<TargetCreatedEvent> = Vec::new();
         let mut new_target_ids: HashSet<String> = HashSet::new();
@@ -1419,6 +1607,16 @@ impl DaemonState {
         loop {
             match rx.try_recv() {
                 Ok(event) => {
+                    if matches!(
+                        event.method.as_str(),
+                        "Target.attachedToTarget"
+                            | "Target.detachedFromTarget"
+                            | "Page.frameAttached"
+                            | "Page.frameNavigated"
+                            | "Page.frameDetached"
+                    ) {
+                        frame_lifecycle.push(event.clone());
+                    }
                     // Target events are not session-scoped; handle them first
                     match event.method.as_str() {
                         "Target.targetCreated" => {
@@ -1963,6 +2161,7 @@ impl DaemonState {
         }
 
         DrainedEvents {
+            frame_lifecycle,
             pending_acks,
             new_targets,
             changed_targets,
@@ -2219,6 +2418,8 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
     state.active_iframe_sessions.clear();
+    state.reset_frame_selection();
+    state.ref_map.clear();
     state.webmcp.clear_all();
     state.screencasting = false;
     state.reset_input_state();
@@ -2370,6 +2571,32 @@ fn policy_actions_for_command(
     actions
 }
 
+/// Commands whose execution depends on a live selected document. Explicit
+/// frame refs use their own provenance and can recover a removed selection.
+fn command_uses_selected_frame(cmd: &Value) -> bool {
+    let action = cmd["action"].as_str().unwrap_or_default();
+    match action {
+        "frame" => cmd["selector"]
+            .as_str()
+            .is_some_and(|s| super::element::parse_ref(s).is_none()),
+        "wait" => ["selector", "text", "function"]
+            .iter()
+            .any(|key| cmd.get(key).is_some()),
+        "screenshot" => cmd.get("selector").is_some() || cmd["annotate"].as_bool() == Some(true),
+        "diff_screenshot" => cmd.get("selector").is_some(),
+        "evaluate" | "snapshot" | "diff_snapshot" | "click" | "dblclick" | "fill" | "type"
+        | "press" | "hover" | "scroll" | "select" | "check" | "uncheck" | "gettext"
+        | "getattribute" | "isvisible" | "isenabled" | "ischecked" | "keyboard"
+        | "input_keyboard" | "keydown" | "keyup" | "inserttext" | "focus" | "clear"
+        | "selectall" | "scrollintoview" | "dispatch" | "highlight" | "tap" | "boundingbox"
+        | "innertext" | "innerhtml" | "inputvalue" | "setvalue" | "count" | "styles" | "upload"
+        | "download" | "waitforfunction" | "getbyrole" | "getbytext" | "getbylabel"
+        | "getbyplaceholder" | "getbyalttext" | "getbytitle" | "getbytestid" | "nth" | "find"
+        | "drag" | "multiselect" => true,
+        _ => false,
+    }
+}
+
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let id = cmd
@@ -2431,10 +2658,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     if let Err(e) = state.drain_cdp_events_background().await {
         return error_response(&id, &super::browser::to_ai_friendly_error(&e));
     }
-
-    // Keep element resolution in sync with the `frame` selection (see
-    // element::set_active_frame for why this is mirrored).
-    super::element::set_active_frame(state.active_frame.as_ref());
 
     // `--pin-tab` from the client enables strict tab binding even when the
     // daemon was started without the flag, and `--no-pin-tab` (pinTab: false)
@@ -2670,6 +2893,24 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    let mut prepared_command = None;
+    if state.browser.is_some() && state.active_frame.is_some() && command_uses_selected_frame(cmd) {
+        let timeout_ms = state.timeout_ms(cmd);
+        let start = tokio::time::Instant::now();
+        if let Err(error) = state.reconcile_selected_frame(timeout_ms).await {
+            return error_response(&id, &error);
+        }
+        if matches!(action, "wait" | "waitforfunction") {
+            let mut remaining = cmd.clone();
+            remaining["timeout"] =
+                json!(timeout_ms.saturating_sub(start.elapsed().as_millis() as u64));
+            prepared_command = Some(remaining);
+        }
+    }
+    // Commands are serialized. Publish only the reconciled selection, after
+    // launch/reset handling, so element helpers cannot use an obsolete owner.
+    super::element::set_active_frame(state.active_frame.as_ref());
+    let cmd = prepared_command.as_ref().unwrap_or(cmd);
     let result = match action {
         "launch" => handle_launch(cmd, state).await,
         "navigate" => handle_navigate(cmd, state).await,
@@ -4882,6 +5123,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         state.iframe_sessions.clear();
     }
 
+    state.reset_frame_selection();
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
 
     let wait_until = cmd
@@ -4934,7 +5176,6 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame = None;
     let result = mgr.navigate(url, wait_until).await?;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
@@ -5891,6 +6132,7 @@ async fn handle_ischecked(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 }
 
 async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
+    state.reset_frame_selection();
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.back().await?;
@@ -5909,6 +6151,7 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
 }
 
 async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
+    state.reset_frame_selection();
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.forward().await?;
@@ -5927,6 +6170,7 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
 }
 
 async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
+    state.reset_frame_selection();
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.reload().await?;
@@ -6710,7 +6954,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame = None;
+    state.reset_frame_selection();
     state.webmcp.clear_invocations();
     let mut result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -6766,7 +7010,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     // the user on the old tab with dead refs and frame scope.
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame = None;
+    state.reset_frame_selection();
     state.webmcp.clear_invocations();
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
@@ -6825,7 +7069,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.webmcp.clear_invocations();
-    state.active_frame = None;
+    state.reset_frame_selection();
     state.refresh_active_iframe_sessions().await;
     Ok(result)
 }
@@ -9007,7 +9251,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                 &state.iframe_sessions,
                 &ref_id,
             )?;
-            state.active_frame = Some(frame);
+            state.select_frame(frame).await?;
             return Ok(json!({ "frame": label }));
         }
 
@@ -9055,7 +9299,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             &state.iframe_sessions,
             sel,
         )?;
-        state.active_frame = Some(frame);
+        state.select_frame(frame).await?;
         return Ok(json!({ "frame": label }));
     }
 
@@ -9083,10 +9327,12 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                 .get(&frame_id)
                 .cloned()
                 .unwrap_or(source_session_id);
-            state.active_frame = Some(FrameContext {
-                frame_id,
-                session_id,
-            });
+            state
+                .select_frame(FrameContext {
+                    frame_id,
+                    session_id,
+                })
+                .await?;
             return Ok(json!({ "frame": name.or(url).unwrap_or("frame") }));
         }
     }
@@ -9095,7 +9341,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 }
 
 async fn handle_mainframe(state: &mut DaemonState) -> Result<Value, String> {
-    state.active_frame = None;
+    state.reset_frame_selection();
     Ok(json!({ "frame": "main" }))
 }
 
@@ -11478,6 +11724,8 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
     } = cred;
 
     let auth_timeout_ms = state.timeout_ms(cmd);
+    state.reset_frame_selection();
+    state.ref_map.clear();
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     mgr.navigate(&url, AUTH_LOGIN_WAIT_UNTIL).await?;
 
@@ -12196,7 +12444,11 @@ fn error_response(id: &str, error: &str) -> Value {
     });
     // Machine-readable code for "the bound tab no longer exists" so scripts
     // using --json can match on it instead of parsing the message.
-    if error.starts_with(super::browser::TAB_GONE_PREFIX) {
+    if error == frame::FRAME_GONE {
+        resp["code"] = json!("frame_gone");
+    } else if error == frame::FRAME_NOT_READY {
+        resp["code"] = json!("frame_not_ready");
+    } else if error.starts_with(super::browser::TAB_GONE_PREFIX) {
         resp["code"] = json!("tab_gone");
     } else if let Some((code, _)) = error.split_once(": ") {
         if code.starts_with("webmcp_") {
@@ -12233,6 +12485,195 @@ mod tests {
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn selected_frame_guard_keeps_recovery_and_tab_commands_available() {
+        for command in [
+            json!({"action":"mainframe"}),
+            json!({"action":"frame", "selector":"@e1"}),
+            json!({"action":"frame", "selector":"e1"}),
+            json!({"action":"frame", "name":"legacy"}),
+            json!({"action":"navigate"}),
+            json!({"action":"back"}),
+            json!({"action":"forward"}),
+            json!({"action":"reload"}),
+            json!({"action":"tab_switch"}),
+            json!({"action":"tab_close"}),
+            json!({"action":"close"}),
+            json!({"action":"console"}),
+            json!({"action":"errors"}),
+            json!({"action":"wait", "url":"example.test"}),
+            json!({"action":"wait", "timeout":100}),
+            json!({"action":"screenshot"}),
+            json!({"action":"evalhandle"}),
+        ] {
+            assert!(!command_uses_selected_frame(&command), "{command}");
+        }
+        for command in [
+            json!({"action":"evaluate"}),
+            json!({"action":"snapshot"}),
+            json!({"action":"find"}),
+            json!({"action":"click", "selector":"@e1"}),
+            json!({"action":"frame", "selector":"iframe"}),
+            json!({"action":"wait", "function":"true"}),
+            json!({"action":"wait", "text":"ready"}),
+            json!({"action":"wait", "selector":"button"}),
+            json!({"action":"waitforfunction"}),
+            json!({"action":"screenshot", "annotate":true}),
+            json!({"action":"screenshot", "selector":"button"}),
+            json!({"action":"press"}),
+            json!({"action":"keyboard", "subaction":"type"}),
+            json!({"action":"input_keyboard"}),
+            json!({"action":"keydown"}),
+            json!({"action":"keyup"}),
+            json!({"action":"inserttext"}),
+        ] {
+            assert!(command_uses_selected_frame(&command), "{command}");
+        }
+    }
+
+    #[test]
+    fn selected_frame_errors_have_stable_codes() {
+        for (message, code) in [
+            (frame::FRAME_GONE, "frame_gone"),
+            (frame::FRAME_NOT_READY, "frame_not_ready"),
+        ] {
+            let response =
+                error_response("1", &super::super::browser::to_ai_friendly_error(message));
+            assert_eq!(response["success"], false);
+            assert_eq!(response["code"], code);
+            assert_eq!(response["error"], message);
+        }
+    }
+
+    /// A real WebSocket/CDP reader with a controllable frame tree and default
+    /// context. No Chrome or timing-dependent renderer navigation is needed.
+    async fn selected_frame_mock() -> (
+        DaemonState,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicUsize::new(0));
+        let queried = Arc::new(tokio::sync::Notify::new());
+        let input_count = Arc::new(AtomicUsize::new(0));
+        let (server_mode, server_queried, server_input) =
+            (mode.clone(), queried.clone(), input_count.clone());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut context_sent = false;
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let method = command["method"].as_str().unwrap();
+                if method.starts_with("Input.") {
+                    server_input.fetch_add(1, Ordering::SeqCst);
+                }
+                let mut result = json!({});
+                if method == "Page.getFrameTree" {
+                    let mode = server_mode.load(Ordering::SeqCst);
+                    server_queried.notify_one();
+                    if mode == 3 {
+                        socket.send(Message::Text(json!({"id":command["id"], "error":{"code":-32000,"message":"renderer temporarily unavailable"}}).to_string())).await.unwrap();
+                        continue;
+                    }
+                    if mode == 4 {
+                        continue;
+                    }
+                    if mode == 1 && !context_sent {
+                        socket.send(Message::Text(json!({"method":"Runtime.executionContextCreated", "params":{"context":{"id":7,"uniqueId":"frame-context","auxData":{"isDefault":true,"frameId":"inner"}}}}).to_string())).await.unwrap();
+                        context_sent = true;
+                    }
+                    result = json!({"frameTree":{"frame":{"id":"top","loaderId":"top-doc"}, "childFrames":if mode == 2 { json!([]) } else { json!([{"frame":{"id":"inner","parentId":"top","loaderId":"child-doc"}}]) }}});
+                }
+                socket
+                    .send(Message::Text(
+                        json!({"id":command["id"], "result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let browser = BrowserManager::connect_cdp_direct(&url).await.unwrap();
+        let mut state = DaemonState::new();
+        state.event_rx = Some(browser.client.subscribe());
+        state.browser = Some(browser);
+        state.active_frame = Some(FrameContext {
+            frame_id: "inner".into(),
+            session_id: String::new(),
+        });
+        (state, mode, queried, input_count, server)
+    }
+
+    #[tokio::test]
+    async fn selected_frame_preflight_waits_for_context_without_dispatching_input() {
+        use std::sync::atomic::Ordering;
+        let (mut state, mode, queried, input_count, server) = selected_frame_mock().await;
+        let release = tokio::spawn(async move {
+            queried.notified().await;
+            mode.store(1, Ordering::SeqCst);
+        });
+        state.reconcile_selected_frame(1000).await.unwrap();
+        release.await.unwrap();
+        assert_eq!(state.selected_frame_state.status, SelectionStatus::Ready);
+        assert_eq!(state.active_frame.as_ref().unwrap().frame_id, "inner");
+        assert_eq!(input_count.load(Ordering::SeqCst), 0);
+        state.reconcile_selected_frame(0).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn selected_frame_preflight_distinguishes_absence_from_unavailable_renderer() {
+        use std::sync::atomic::Ordering;
+        for (mode_value, expected) in [
+            (0, frame::FRAME_NOT_READY),
+            (2, frame::FRAME_GONE),
+            (3, frame::FRAME_NOT_READY),
+            (4, frame::FRAME_NOT_READY),
+        ] {
+            let (mut state, mode, _, _, server) = selected_frame_mock().await;
+            mode.store(mode_value, Ordering::SeqCst);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                state.reconcile_selected_frame(50),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!(
+                state.selected_frame_state.status == SelectionStatus::Removed,
+                expected == frame::FRAME_GONE
+            );
+            if expected != frame::FRAME_GONE {
+                mode.store(1, Ordering::SeqCst);
+                state.reconcile_selected_frame(1000).await.unwrap();
+            }
+            state.reset_frame_selection();
+            state.reconcile_selected_frame(0).await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_frame_zero_timeout_does_not_wait_for_a_renderer() {
+        let (mut state, _, _, _, server) = selected_frame_mock().await;
+        assert_eq!(
+            state.reconcile_selected_frame(0).await.unwrap_err(),
+            frame::FRAME_NOT_READY
+        );
+        state.selected_frame_state.status = SelectionStatus::Removed;
+        assert_eq!(
+            state.reconcile_selected_frame(0).await.unwrap_err(),
+            frame::FRAME_GONE
+        );
+        server.abort();
+    }
 
     /// A binding-recovery failure must tear the connection down: the attach
     /// paths set `state.browser` before calling this, so returning the error

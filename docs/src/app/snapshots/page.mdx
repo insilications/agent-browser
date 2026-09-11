@@ -107,6 +107,8 @@ agent-browser frame main        # Return to main frame
 
 Frame switching is relative. After entering an iframe, a selector or a ref from the new scoped snapshot resolves inside the selected frame, including when nesting crosses an out-of-process iframe boundary. Taking a snapshot replaces the current ref map, so refs from earlier snapshots are intentionally no longer available.
 
+A selected frame follows its frame ID when its renderer changes. Replacing its document invalidates refs belonging to that document, even when the frame ID survives; take a new snapshot before interacting by ref. Removing the selected frame or an ancestor causes scoped snapshots and interactions to fail with `frame_gone`. Run `frame main`, select the frame again, and take a new snapshot. Frame selection never moves automatically to a replacement iframe with matching attributes.
+
 ## Best practices
 
 1. Use `-i` to reduce output to actionable elements

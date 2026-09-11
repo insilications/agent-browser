@@ -2559,6 +2559,16 @@ agent-browser frame - Switch frame context
 Usage: agent-browser frame <selector|ref|main>
 
 Switch to an iframe or back to the main frame.
+Selection follows the same frame ID across renderer changes before commands.
+Renderer preparation uses the existing command timeout. Started commands and
+waits are not replayed across renderer changes. Replaced documents invalidate
+their element refs; take a new snapshot.
+
+A removed selection blocks frame-dependent commands and keyboard input:
+  frame_gone: Selected frame is no longer available. Run `frame main` or select the frame again.
+  frame_not_ready: Selected frame is not ready. Retry the command or run `frame main`.
+JSON and MCP responses include these codes. Use main, then select and snapshot
+again. Selection never falls back to the main document or a matching replacement.
 
 Arguments:
   <selector>           CSS selector for iframe, relative to current frame
