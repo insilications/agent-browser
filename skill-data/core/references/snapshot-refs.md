@@ -187,6 +187,10 @@ agent-browser click @e5
 - Empty iframes or iframes with no interactive content are omitted from the output
 - To scope a snapshot to a single iframe, use `frame @ref` then `snapshot -i`
 
+Frame selection and element refs have separate lifetimes. If a selected iframe navigates into or out of another renderer, the next scoped command resolves the same browsing frame's current renderer automatically. Refs from the replaced document are invalidated. A `click @e7` after navigation can therefore report `Unknown ref: e7` even though frame recovery succeeded. Take a new snapshot in the selected frame and use its refs. The invalidated ID is never reassigned to a different element within the browser session.
+
+If the selected frame or an ancestor is removed, scoped snapshots and interactions return `frame_gone`. Run `frame main`, select the desired iframe, and snapshot again. If readiness checks expire without confirming removal, the code is `frame_not_ready`; retry or return to main. Recovery happens before dispatch and does not replay an action already in progress. JSON output and MCP responses preserve both codes.
+
 ## Troubleshooting
 
 ### "Ref not found" Error

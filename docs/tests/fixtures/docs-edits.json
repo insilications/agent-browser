@@ -23,7 +23,7 @@
       },
       {
         "from": "The `frame` command accepts element refs (`@e3`), CSS selectors (`\"#my-iframe\"`), or frame name/URL.",
-        "to": "The `frame` command accepts element refs (`@e3` or `e3`) and CSS selectors (`\"#my-iframe\"`). Selection is relative to the current frame, so after entering one iframe the next selector is evaluated in that iframe's document. A ref from a new scoped snapshot is resolved in the CDP session that produced it, including for nested same-process, cross-origin, and out-of-process iframes. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid."
+        "to": "The `frame` command accepts element refs (`@e3` or `e3`) and CSS selectors (`\"#my-iframe\"`). Selection is relative to the current frame, so after entering one iframe the next selector is evaluated in that iframe's document. A ref from a new scoped snapshot is resolved in the CDP session that produced it, including for nested same-process, cross-origin, and out-of-process iframes. Surviving DOM elements retain their refs within the same document and renderer. Replaced documents invalidate affected refs without recycling their IDs; take a fresh snapshot after navigation."
       },
       {
         "from": "snapshot --delta returns full, unchanged, or incremental updates per tab and option set. URL changes or large deltas return full state; --full resets the baseline. Apply a delta’s changes to ref metadata and treeChange to the previous tree: split on newlines, replace deleteCount lines at zero-based startLine with lines, then rejoin. Apply both to baseRevision before advancing to revision.",
@@ -31,7 +31,7 @@
       },
       {
         "from": "The frame command accepts element refs (@e3), CSS selectors (\"#my-iframe\"), or frame name/URL.",
-        "to": "The frame command accepts element refs (@e3 or e3) and CSS selectors (\"#my-iframe\"). Selection is relative to the current frame, so after entering one iframe the next selector is evaluated in that iframe's document. A ref from a new scoped snapshot is resolved in the CDP session that produced it, including for nested same-process, cross-origin, and out-of-process iframes. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid."
+        "to": "The frame command accepts element refs (@e3 or e3) and CSS selectors (\"#my-iframe\"). Selection is relative to the current frame, so after entering one iframe the next selector is evaluated in that iframe's document. A ref from a new scoped snapshot is resolved in the CDP session that produced it, including for nested same-process, cross-origin, and out-of-process iframes. Surviving DOM elements retain their refs within the same document and renderer. Replaced documents invalidate affected refs without recycling their IDs; take a fresh snapshot after navigation."
       }
     ],
     "/configuration": [
