@@ -6098,6 +6098,30 @@ async fn e2e_auth_login_no_navigate_preserves_active_page_state() {
         )
         .await,
     );
+    // No-navigation login uses the top-level form while preserving the
+    // caller's selected frame and its existing snapshot references.
+    frame_test_command(
+        &mut state,
+        json!({
+            "action": "evaluate",
+            "script": "new Promise(resolve => { const frame = document.createElement('iframe'); frame.id = 'retained-frame'; frame.srcdoc = '<button>Retained frame button</button>'; frame.onload = () => resolve(true); document.body.appendChild(frame); })",
+        }),
+    )
+    .await;
+    frame_test_command(
+        &mut state,
+        json!({ "action": "frame", "selector": "#retained-frame" }),
+    )
+    .await;
+    frame_test_command(&mut state, json!({ "action": "snapshot" })).await;
+    let selected_frame = state.active_frame.clone().expect("selected child frame");
+    let retained_ref = state
+        .ref_map
+        .entries_sorted()
+        .into_iter()
+        .find(|(_, entry)| entry.name == "Retained frame button")
+        .expect("child frame button reference")
+        .0;
     let request_count_before = document_requests.load(Ordering::SeqCst);
 
     let login = execute_command(
@@ -6111,6 +6135,17 @@ async fn e2e_auth_login_no_navigate_preserves_active_page_state() {
         document_requests.load(Ordering::SeqCst),
         request_count_before
     );
+
+    assert_eq!(state.active_frame.as_ref(), Some(&selected_frame));
+    assert!(state.ref_map.get(&retained_ref).is_some());
+    assert_evaluate(
+        &mut state,
+        "retained-frame",
+        "document.querySelector('button').textContent",
+        json!("Retained frame button"),
+    )
+    .await;
+    frame_test_command(&mut state, json!({ "action": "mainframe" })).await;
 
     let verify = execute_command(
         &json!({
@@ -9294,12 +9329,20 @@ async fn e2e_click_new_tab_inherits_user_agent_and_headers() {
     let resp = execute_command(
         &json!({
             "id": "3", "action": "navigate",
-            "url": format!("data:text/html,<a id='next' href='{}/click'>next</a>", base_url),
+            "url": format!("data:text/html,<iframe id='source' srcdoc=\"<a id='next' href='{}/click'>next</a>\"></iframe>", base_url),
         }),
         &mut state,
     )
     .await;
     assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "select-frame", "action": "frame", "selector": "#source" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(state.active_frame.is_some());
 
     let resp = execute_command(
         &json!({ "id": "4", "action": "click", "selector": "#next", "newTab": true }),
@@ -10959,6 +11002,15 @@ setTimeout(() => { window.INNER_READY = true; }, 50);
 #[tokio::test]
 #[ignore]
 async fn e2e_frame_selection_preserves_nested_oopif_context() {
+    // The merged command pipeline has a large debug future. Keep this long
+    // workflow within the default test-thread stack without changing dispatch.
+    fn execute_command<'a>(
+        command: &'a Value,
+        state: &'a mut DaemonState,
+    ) -> impl std::future::Future<Output = Value> + 'a {
+        Box::pin(super::actions::execute_command(command, state))
+    }
+
     fn iframe_ref(resp: &Value, name: &str) -> String {
         get_data(resp)["refs"]
             .as_object()
@@ -11296,6 +11348,478 @@ async fn e2e_frame_selection_preserves_nested_oopif_context() {
     assert_eq!(get_data(&resp)["result"], "inner-main-world");
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    server.abort();
+}
+
+async fn frame_test_command(state: &mut DaemonState, command: Value) -> Value {
+    let response = execute_command(&command, state).await;
+    assert_success(&response);
+    response
+}
+
+/// Observe destination readiness independently of the saved selection. This
+/// prevents a stale selection or a fixed sleep from masking the regression.
+async fn wait_for_frame_destination(
+    state: &mut DaemonState,
+    frame_id: &str,
+    parent_session: &str,
+    hostname: &str,
+    dedicated: bool,
+) {
+    let mut last_probe = String::new();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            last_probe = "draining lifecycle events".into();
+            state.drain_cdp_events_background().await.unwrap();
+            if state.iframe_sessions.contains_key(frame_id) != dedicated {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+            let browser = state.browser.as_ref().unwrap();
+            let sid = state.iframe_sessions.get(frame_id).map(String::as_str).unwrap_or(parent_session);
+            let frame = super::element::FrameContext { frame_id: frame_id.into(), session_id: sid.into() };
+            if let Ok(context) = super::element::main_world_execution_context(&browser.client, parent_session, Some(&frame)) {
+                let expression = format!("document.readyState === 'complete' && window.INNER_REALM === 'inner-main-world' && location.hostname === {}", json!(hostname));
+                last_probe = format!("evaluating destination in {sid}");
+                let result = super::element::evaluate_in_context(&browser.client, &context, &expression, true, false).await;
+                last_probe = format!("session={sid} result={result:?}");
+                if result.is_ok_and(|result| result.result.value == Some(json!(true))) { break; }
+            } else {
+                last_probe = format!("no context for frame={frame_id} session={sid}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }).await;
+    assert!(
+        completed.is_ok(),
+        "destination {hostname} should load: {last_probe}; selected={:?}; sessions={:?}",
+        state.active_frame,
+        state.iframe_sessions
+    );
+}
+
+async fn assert_selected_frame_operations(state: &mut DaemonState) {
+    let eval = frame_test_command(
+        state,
+        json!({"action":"evaluate", "script":"window.INNER_REALM", "timeout":2000}),
+    )
+    .await;
+    assert_eq!(eval["data"]["result"], "inner-main-world");
+    let text = frame_test_command(state, json!({"action":"gettext", "selector":"#inside-b"})).await;
+    assert_eq!(text["data"]["text"], "hello");
+    for command in [
+        json!({"action":"wait", "function":"window.INNER_READY === true", "timeout":2000}),
+        json!({"action":"waitforfunction", "expression":"window.INNER_READY === true", "timeout":2000}),
+        json!({"action":"wait", "selector":"#inside-b", "timeout":2000}),
+        json!({"action":"click", "selector":"#inside-b-button"}),
+    ] {
+        frame_test_command(state, command).await;
+    }
+    let clicked = frame_test_command(
+        state,
+        json!({"action":"evaluate", "script":"document.body.dataset.clicked"}),
+    )
+    .await;
+    assert_eq!(clicked["data"]["result"], "true");
+    frame_test_command(
+        state,
+        json!({"action":"evaluate", "script":"delete document.body.dataset.clicked"}),
+    )
+    .await;
+    let snapshot =
+        frame_test_command(state, json!({"action":"snapshot", "interactive":true})).await;
+    assert!(snapshot["data"]["snapshot"]
+        .as_str()
+        .unwrap()
+        .contains("Click inside B"));
+    let button_ref = snapshot["data"]["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Click inside B")
+        .unwrap()
+        .0;
+    frame_test_command(
+        state,
+        json!({"action":"click", "selector":format!("@{button_ref}")}),
+    )
+    .await;
+    let clicked = frame_test_command(
+        state,
+        json!({"action":"evaluate", "script":"document.body.dataset.clicked"}),
+    )
+    .await;
+    assert_eq!(clicked["data"]["result"], "true");
+}
+
+/// Select once, then follow the same frame through both ownership changes.
+/// The nested variant returns to an OOPIF parent, not the top-page session.
+#[tokio::test]
+#[ignore]
+async fn e2e_selected_frame_follows_renderer_transitions() {
+    let (_env, _dir) = binding_test_env();
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+    frame_test_command(
+        &mut state,
+        json!({"action":"launch", "headless":true, "args":["--site-per-process"]}),
+    )
+    .await;
+    for nested in [false, true] {
+        let path = if nested { "top" } else { "outer" };
+        frame_test_command(
+            &mut state,
+            json!({"action":"navigate", "url":format!("http://localhost:{port}/{path}")}),
+        )
+        .await;
+        if nested {
+            frame_test_command(&mut state, json!({"action":"frame", "selector":"#outer"})).await;
+        }
+        let parent_session = state
+            .active_frame
+            .as_ref()
+            .map(|f| f.session_id.clone())
+            .unwrap_or_else(|| {
+                state
+                    .browser
+                    .as_ref()
+                    .unwrap()
+                    .active_session_id()
+                    .unwrap()
+                    .into()
+            });
+        frame_test_command(&mut state, json!({"action":"frame", "selector":"#inner"})).await;
+        let original = state.active_frame.clone().unwrap();
+        assert_eq!(original.session_id, parent_session);
+        let client = state.browser.as_ref().unwrap().client.clone();
+        let cross_host = if nested { "localhost" } else { "127.0.0.1" };
+        let parent_host = if nested { "127.0.0.1" } else { "localhost" };
+        for (host, dedicated) in [(cross_host, true), (parent_host, false)] {
+            // A departed document's ref must remain retired after subsequent snapshots.
+            let snapshot =
+                frame_test_command(&mut state, json!({"action":"snapshot", "interactive":true}))
+                    .await;
+            let old_ref = snapshot["data"]["refs"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, entry)| entry["name"] == "Click inside B")
+                .unwrap()
+                .0
+                .clone();
+            let delta_command = json!({"action":"snapshot", "delta":true, "interactive":true});
+            frame_test_command(&mut state, delta_command.clone()).await;
+            let baseline = frame_test_command(&mut state, delta_command.clone()).await;
+            assert_eq!(baseline["data"]["snapshot"]["kind"], "unchanged");
+            let next_revision = baseline["data"]["snapshot"]["revision"].as_u64().unwrap() + 1;
+            client.send_command("Runtime.evaluate", Some(json!({"expression":format!("document.querySelector('#inner').src='http://{host}:{port}/inner'; true")})), Some(&parent_session)).await.unwrap();
+            wait_for_frame_destination(
+                &mut state,
+                &original.frame_id,
+                &parent_session,
+                host,
+                dedicated,
+            )
+            .await;
+            let eval = frame_test_command(
+                &mut state,
+                json!({"action":"evaluate", "script":"window.INNER_REALM", "timeout":2000}),
+            )
+            .await;
+            assert_eq!(eval["data"]["result"], "inner-main-world");
+            let selected = state.active_frame.as_ref().unwrap();
+            assert_eq!(selected.frame_id, original.frame_id);
+            if dedicated {
+                assert_ne!(selected.session_id, parent_session);
+                assert_eq!(
+                    state.iframe_sessions[&original.frame_id],
+                    selected.session_id
+                );
+            } else {
+                assert_eq!(selected.session_id, parent_session);
+                assert!(!state.iframe_sessions.contains_key(&original.frame_id));
+            }
+            let replacement = frame_test_command(&mut state, delta_command).await;
+            assert_eq!(replacement["data"]["snapshot"]["kind"], "full");
+            assert_eq!(replacement["data"]["snapshot"]["revision"], next_revision);
+            let stale = execute_command(
+                &json!({"action":"click", "selector":format!("@{old_ref}")}),
+                &mut state,
+            )
+            .await;
+            assert_eq!(
+                stale["success"], false,
+                "old ref unexpectedly survived: {stale}"
+            );
+            assert_eq!(stale["error"], format!("Unknown ref: {old_ref}"));
+            assert_selected_frame_operations(&mut state).await;
+            assert!(
+                state.ref_map.get(&old_ref).is_none(),
+                "fresh snapshots must never recycle the old ref"
+            );
+        }
+    }
+    frame_test_command(&mut state, json!({"action":"close"})).await;
+    server.abort();
+}
+
+/// Removal is sticky even if a new iframe has identical attributes. Keyboard
+/// paths must fail before dispatch rather than reaching a focused parent input.
+#[tokio::test]
+#[ignore]
+async fn e2e_selected_frame_removal_blocks_input_and_recovers() {
+    let (_env, _dir) = binding_test_env();
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+    frame_test_command(
+        &mut state,
+        json!({"action":"launch", "headless":true, "args":["--site-per-process"]}),
+    )
+    .await;
+    for (nested, select_inner) in [(false, true), (true, false), (true, true)] {
+        let path = if nested { "top" } else { "outer" };
+        frame_test_command(
+            &mut state,
+            json!({"action":"navigate", "url":format!("http://localhost:{port}/{path}")}),
+        )
+        .await;
+        let client = state.browser.as_ref().unwrap().client.clone();
+        let top_sid = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_session_id()
+            .unwrap()
+            .to_string();
+        if nested {
+            frame_test_command(&mut state, json!({"action":"frame", "selector":"#outer"})).await;
+        }
+        if select_inner {
+            frame_test_command(&mut state, json!({"action":"frame", "selector":"#inner"})).await;
+        }
+        let old_button_ref = if select_inner {
+            let snapshot =
+                frame_test_command(&mut state, json!({"action":"snapshot", "interactive":true}))
+                    .await;
+            Some(
+                snapshot["data"]["refs"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, entry)| entry["name"] == "Click inside B")
+                    .unwrap()
+                    .0
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let selected_id = state.active_frame.as_ref().unwrap().frame_id.clone();
+        let removed_selector = if nested { "#outer" } else { "#inner" };
+        client.send_command("Runtime.evaluate", Some(json!({"expression":format!(
+            "window.frameReviewKeys=[]; document.addEventListener('keydown', e=>frameReviewKeys.push(e.key)); document.body.insertAdjacentHTML('beforeend', '<input id=parent-input>'); document.querySelector({}).remove(); document.querySelector('#parent-input').focus(); true", json!(removed_selector)
+        )})), Some(&top_sid)).await.unwrap();
+        if let Some(old_ref) = old_button_ref {
+            // Report loss of the selected frame before attempting to resolve
+            // a button ref from the snapshot taken just before removal.
+            let response = execute_command(
+                &json!({"action":"click", "selector":format!("@{old_ref}")}),
+                &mut state,
+            )
+            .await;
+            assert_error_code(&response, "frame_gone");
+            assert_eq!(response["error"], super::frame::FRAME_GONE);
+        }
+        for command in [
+            json!({"action":"evaluate", "script":"document.title"}),
+            json!({"action":"gettext", "selector":"body"}),
+            json!({"action":"snapshot"}),
+            json!({"action":"click", "selector":"#parent-input"}),
+            json!({"action":"press", "key":"Enter"}),
+            json!({"action":"keyboard", "subaction":"type", "text":"leak"}),
+            json!({"action":"keyboard", "subaction":"insertText", "text":"leak"}),
+            json!({"action":"input_keyboard", "type":"keyDown", "key":"Enter"}),
+            json!({"action":"keydown", "key":"Enter"}),
+            json!({"action":"keyup", "key":"Enter"}),
+            json!({"action":"inserttext", "text":"leak"}),
+            json!({"action":"frame", "selector":"iframe"}),
+            json!({"action":"wait", "function":"true", "timeout":100}),
+            json!({"action":"snapshot", "delta":true}),
+            json!({"action":"screenshot", "ifChanged":true, "selector":"button"}),
+            json!({"action":"screenshot", "ifChanged":true, "annotate":true}),
+        ] {
+            let response = execute_command(&command, &mut state).await;
+            assert_error_code(&response, "frame_gone");
+            assert_eq!(response["error"], super::frame::FRAME_GONE);
+        }
+        assert_eq!(state.active_frame.as_ref().unwrap().frame_id, selected_id);
+        let untouched = client.send_command("Runtime.evaluate", Some(json!({"expression":"[frameReviewKeys, document.querySelector('#parent-input').value]", "returnByValue":true})), Some(&top_sid)).await.unwrap();
+        assert_eq!(untouched["result"]["value"], json!([[], ""]));
+        let replacement_id = removed_selector.trim_start_matches('#');
+        let replacement_path = if nested { "outer" } else { "inner" };
+        client.send_command("Runtime.evaluate", Some(json!({"expression":format!("document.body.insertAdjacentHTML('beforeend', '<iframe id={replacement_id} src=/{replacement_path}></iframe>'); true")})), Some(&top_sid)).await.unwrap();
+        let gone = execute_command(
+            &json!({"action":"evaluate", "script":"document.title"}),
+            &mut state,
+        )
+        .await;
+        assert_error_code(&gone, "frame_gone");
+        frame_test_command(&mut state, json!({"action":"console"})).await;
+        frame_test_command(&mut state, json!({"action":"errors"})).await;
+        frame_test_command(&mut state, json!({"action":"mainframe"})).await;
+        let main = frame_test_command(
+            &mut state,
+            json!({"action":"evaluate", "script":"document.title"}),
+        )
+        .await;
+        assert_eq!(main["data"]["result"], if nested { "Top" } else { "Outer" });
+        frame_test_command(
+            &mut state,
+            json!({"action":"frame", "selector":removed_selector}),
+        )
+        .await;
+        assert_ne!(state.active_frame.as_ref().unwrap().frame_id, selected_id);
+    }
+    frame_test_command(&mut state, json!({"action":"close"})).await;
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_selected_frame_recovers_through_surviving_iframe_ref() {
+    let (_env, _dir) = binding_test_env();
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+    frame_test_command(
+        &mut state,
+        json!({"action":"launch", "headless":true, "args":["--site-per-process"]}),
+    )
+    .await;
+    frame_test_command(
+        &mut state,
+        json!({"action":"navigate", "url":format!("http://localhost:{port}/siblings")}),
+    )
+    .await;
+    let snapshot =
+        frame_test_command(&mut state, json!({"action":"snapshot", "interactive":true})).await;
+    let iframe_ref = |name| {
+        snapshot["data"]["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["role"] == "Iframe" && entry["name"] == name)
+            .unwrap()
+            .0
+            .clone()
+    };
+    let first = iframe_ref("First");
+    let second = iframe_ref("Second");
+    frame_test_command(
+        &mut state,
+        json!({"action":"frame", "selector":format!("@{first}")}),
+    )
+    .await;
+    let selected = state.active_frame.clone().unwrap();
+    let browser = state.browser.as_ref().unwrap();
+    browser
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":"document.querySelector('#first-frame').remove(); true"})),
+            Some(browser.active_session_id().unwrap()),
+        )
+        .await
+        .unwrap();
+    let gone = execute_command(
+        &json!({"action":"evaluate", "script":"document.title"}),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&gone, "frame_gone");
+    let dead_ref = execute_command(
+        &json!({"action":"frame", "selector":format!("@{first}")}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(dead_ref["success"], false);
+    assert_eq!(state.active_frame.as_ref(), Some(&selected));
+    let still_gone = execute_command(&json!({"action":"press", "key":"Enter"}), &mut state).await;
+    assert_error_code(&still_gone, "frame_gone");
+    frame_test_command(
+        &mut state,
+        json!({"action":"frame", "selector":format!("@{second}")}),
+    )
+    .await;
+    assert_ne!(
+        state.active_frame.as_ref().unwrap().frame_id,
+        selected.frame_id
+    );
+    let recovered = frame_test_command(
+        &mut state,
+        json!({"action":"evaluate", "script":"document.title"}),
+    )
+    .await;
+    assert_eq!(recovered["data"]["result"], "Second");
+    frame_test_command(&mut state, json!({"action":"close"})).await;
+    server.abort();
+}
+
+/// Start the command while Chrome's replacement target is still paused by
+/// auto-attach, before the daemon has prepared or resumed its renderer.
+#[tokio::test]
+#[ignore]
+async fn e2e_selected_frame_prepares_paused_replacement_before_dispatch() {
+    let (_env, _dir) = binding_test_env();
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+    frame_test_command(
+        &mut state,
+        json!({"action":"launch", "headless":true, "args":["--site-per-process"]}),
+    )
+    .await;
+    frame_test_command(
+        &mut state,
+        json!({"action":"navigate", "url":format!("http://localhost:{port}/outer")}),
+    )
+    .await;
+    frame_test_command(&mut state, json!({"action":"frame", "selector":"#inner"})).await;
+    let selected = state.active_frame.clone().unwrap();
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let mut events = client.subscribe();
+    client.send_command("Runtime.evaluate", Some(json!({"expression":format!("document.querySelector('#inner').src='http://127.0.0.1:{port}/inner'; true")})), Some(&selected.session_id)).await.unwrap();
+    let attached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.method == "Target.attachedToTarget"
+                && event.params["targetInfo"]["targetId"] == selected.frame_id
+            {
+                break event.params;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let replacement_session = attached["sessionId"].as_str().unwrap();
+    assert_eq!(attached["waitingForDebugger"], true);
+    assert!(!state.iframe_sessions.contains_key(&selected.frame_id));
+    assert!(client
+        .default_execution_context(replacement_session, &selected.frame_id)
+        .is_none());
+    let response = frame_test_command(
+        &mut state,
+        json!({"action":"evaluate", "script":"window.INNER_REALM", "timeout":2000}),
+    )
+    .await;
+    assert_eq!(response["data"]["result"], "inner-main-world");
+    assert_eq!(
+        state.active_frame.as_ref().unwrap().frame_id,
+        selected.frame_id
+    );
+    assert_eq!(
+        state.active_frame.as_ref().unwrap().session_id,
+        replacement_session
+    );
+    frame_test_command(&mut state, json!({"action":"close"})).await;
     server.abort();
 }
 
@@ -12609,4 +13133,206 @@ async fn e2e_mouse_interpolation_starts_at_last_element_interaction() {
         assert!((moves[1][0].as_f64().unwrap() - (start.0 + 100.0)).abs() <= 1.0);
     }
     assert_success(&execute_command(&json!({"id": "99", "action": "close"}), &mut state).await);
+}
+
+/// Exercise durable refs/deltas and page-coordinate cursor bookkeeping in a
+/// same-process child of an OOPIF. Conditional page captures remain unscoped.
+#[tokio::test]
+#[ignore]
+async fn e2e_nested_frame_observations_and_recording_coordinates() {
+    let (_env, dir) = binding_test_env();
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+    frame_test_command(
+        &mut state,
+        json!({"action":"launch", "headless":true, "args":["--site-per-process"]}),
+    )
+    .await;
+    frame_test_command(
+        &mut state,
+        json!({"action":"navigate", "url":format!("http://localhost:{port}/top")}),
+    )
+    .await;
+    frame_test_command(&mut state, json!({"action":"frame", "selector":"#outer"})).await;
+    let parent_session = state.active_frame.as_ref().unwrap().session_id.clone();
+    frame_test_command(&mut state, json!({"action":"frame", "selector":"#inner"})).await;
+    let selected = state.active_frame.clone().unwrap();
+    assert_eq!(selected.session_id, parent_session);
+    assert!(!state.iframe_sessions.contains_key(&selected.frame_id));
+    let page_session = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        parent_session, page_session,
+        "fixture must inherit an OOPIF renderer"
+    );
+    frame_test_command(&mut state, json!({"action":"evaluate", "script":"for(let i=0;i<60;i++){const button=document.createElement('button');button.textContent='Unchanged padding '+i;document.body.appendChild(button)}"})).await;
+    let delta_command = json!({"action":"snapshot", "interactive":true, "delta":true});
+    let first = frame_test_command(&mut state, delta_command.clone()).await;
+    assert_eq!(first["data"]["snapshot"]["kind"], "full");
+    assert_eq!(
+        frame_test_command(&mut state, delta_command.clone()).await["data"]["snapshot"]["kind"],
+        "unchanged"
+    );
+    let button_ref = first["data"]["snapshot"]["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Click inside B")
+        .unwrap()
+        .0
+        .clone();
+    frame_test_command(&mut state, json!({"action":"evaluate", "script":"document.querySelector('#inside-b-button').textContent='Renamed inside B'"})).await;
+    let delta = frame_test_command(&mut state, delta_command.clone()).await;
+    assert_eq!(delta["data"]["snapshot"]["kind"], "delta");
+    let patch = &delta["data"]["snapshot"]["treeChange"];
+    let mut lines: Vec<_> = first["data"]["snapshot"]["tree"]
+        .as_str()
+        .unwrap()
+        .split('\n')
+        .map(str::to_string)
+        .collect();
+    let start = patch["startLine"].as_u64().unwrap() as usize;
+    let count = patch["deleteCount"].as_u64().unwrap() as usize;
+    lines.splice(
+        start..start + count,
+        patch["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap().to_string()),
+    );
+    let full =
+        frame_test_command(&mut state, json!({"action":"snapshot", "interactive":true})).await;
+    assert_eq!(lines.join("\n"), full["data"]["snapshot"].as_str().unwrap());
+    assert_eq!(
+        full["data"]["refs"][&button_ref]["name"],
+        "Renamed inside B"
+    );
+    frame_test_command(
+        &mut state,
+        json!({"action":"click", "selector":format!("@{button_ref}")}),
+    )
+    .await;
+
+    let first_path = dir.path().join("selected-page.png");
+    let next_path = dir.path().join("main-page.png");
+    assert_eq!(
+        frame_test_command(
+            &mut state,
+            json!({"action":"screenshot", "ifChanged":true, "path":first_path})
+        )
+        .await["data"]["changed"],
+        true
+    );
+    frame_test_command(&mut state, json!({"action":"mainframe"})).await;
+    let unchanged_page = frame_test_command(
+        &mut state,
+        json!({"action":"screenshot", "ifChanged":true, "path":next_path}),
+    )
+    .await;
+    assert_eq!(unchanged_page["data"]["changed"], false);
+    assert!(unchanged_page["data"].get("path").is_none());
+    assert!(!next_path.exists());
+    frame_test_command(&mut state, json!({"action":"frame", "selector":"#outer"})).await;
+    frame_test_command(&mut state, json!({"action":"frame", "selector":"#inner"})).await;
+    assert_eq!(
+        frame_test_command(&mut state, delta_command.clone()).await["data"]["snapshot"]["kind"],
+        "full",
+        "unobserved selection changes still break delta continuity"
+    );
+
+    let client = state.browser.as_ref().unwrap().client.clone();
+    client.send_command("Page.navigate", Some(json!({"frameId":selected.frame_id, "url":format!("http://127.0.0.1:{port}/inner")})), Some(&parent_session)).await.unwrap();
+    wait_for_frame_destination(
+        &mut state,
+        &selected.frame_id,
+        &parent_session,
+        "127.0.0.1",
+        false,
+    )
+    .await;
+    let reloaded = frame_test_command(&mut state, delta_command).await;
+    assert_eq!(reloaded["data"]["snapshot"]["kind"], "full");
+    assert!(
+        state.ref_map.get(&button_ref).is_none(),
+        "same-URL navigation must retire the old ref"
+    );
+    let stale = execute_command(
+        &json!({"action":"click", "selector":format!("@{button_ref}")}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(stale["error"], format!("Unknown ref: {button_ref}"));
+
+    client.send_command("Runtime.evaluate", Some(json!({"expression":"document.querySelector('#outer').style.cssText='position:absolute;left:240px;top:160px;width:500px;height:400px;border:10px solid black'"})), Some(&page_session)).await.unwrap();
+    client.send_command("Runtime.evaluate", Some(json!({"expression":"document.querySelector('#inner').style.cssText='position:absolute;left:30px;top:40px;width:350px;height:250px;border:5px solid black'"})), Some(&parent_session)).await.unwrap();
+    frame_test_command(&mut state, json!({"action":"evaluate", "script":"document.body.style.margin='0';document.querySelector('#inside-b-button').style.cssText='position:absolute;left:20px;top:30px;width:80px;height:40px';document.body.insertAdjacentHTML('beforeend', '<button id=drag-target style=\"position:absolute;left:140px;top:130px;width:80px;height:40px\" onmouseup=\"document.body.dataset.dragged=1\">Target</button>')"})).await;
+    let fresh =
+        frame_test_command(&mut state, json!({"action":"snapshot", "interactive":true})).await;
+    let fresh_ref = fresh["data"]["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Click inside B")
+        .unwrap()
+        .0
+        .clone();
+    super::recording::recording_start(
+        &mut state.recording_state,
+        dir.path().join("cursor.webm").to_str().unwrap(),
+        super::recording::RecordingOptions {
+            cursor: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for selector in ["#inside-b-button".to_string(), format!("@{fresh_ref}")] {
+        for action in ["hover", "click", "dblclick"] {
+            frame_test_command(
+                &mut state,
+                json!({"action":action, "selector":selector, "inputMode":"human"}),
+            )
+            .await;
+            let cursor = state
+                .recording_state
+                .shared_cursor
+                .lock()
+                .unwrap()
+                .at(f64::INFINITY);
+            assert!(
+                (cursor.x - 345.0).abs() < 1.0 && (cursor.y - 265.0).abs() < 1.0,
+                "{action} {selector}: {cursor:?}"
+            );
+            assert!(
+                (state.mouse_state.x - cursor.x).abs() < 1.0
+                    && (state.mouse_state.y - cursor.y).abs() < 1.0
+            );
+        }
+    }
+    frame_test_command(&mut state, json!({"action":"drag", "source":"#inside-b-button", "target":"#drag-target", "inputMode":"human", "seed":5})).await;
+    let cursor = state
+        .recording_state
+        .shared_cursor
+        .lock()
+        .unwrap()
+        .at(f64::INFINITY);
+    assert!(
+        (cursor.x - 465.0).abs() < 1.0 && (cursor.y - 365.0).abs() < 1.0,
+        "drag: {cursor:?}"
+    );
+    assert_evaluate(
+        &mut state,
+        "dragged",
+        "document.body.dataset.dragged",
+        json!("1"),
+    )
+    .await;
+    state.recording_state.active = false;
+    frame_test_command(&mut state, json!({"action":"close"})).await;
+    server.abort();
 }

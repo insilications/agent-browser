@@ -926,7 +926,7 @@ fn tools() -> Vec<Value> {
         wait_tool(TOOL_WAIT_FOR_TEXT, "Wait for text", "Wait for text to appear.", json!({ "text": { "type": "string" } }), &["text"]),
         wait_tool(TOOL_WAIT_FOR_URL, "Wait for URL", "Wait for the current URL to match a pattern.", json!({ "url": { "type": "string", "description": "URL glob or pattern." } }), &["url"]),
         wait_tool(TOOL_WAIT_FOR_LOAD, "Wait for load state", "Wait for a page load state.", json!({ "state": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] } }), &["state"]),
-        wait_tool(TOOL_WAIT_FOR_FUNCTION, "Wait for function", "Wait for a JavaScript expression in the current frame's page world to become truthy.", json!({ "expression": { "type": "string" } }), &["expression"]),
+        wait_tool(TOOL_WAIT_FOR_FUNCTION, "Wait for function", "Wait for a JavaScript expression in the current frame's page world to become truthy. Renderer recovery occurs before polling within the same timeout, not during an already-running wait.", json!({ "expression": { "type": "string" } }), &["expression"]),
         tool(
             TOOL_SCREENSHOT,
             "Take screenshot",
@@ -953,7 +953,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_EVAL,
             "Evaluate JavaScript",
-            "Run JavaScript in the current frame's page world using stdin to avoid shell escaping. Page-defined globals are visible.",
+            "Run JavaScript in the current frame's page world using stdin to avoid shell escaping. Page-defined globals are visible. Selected-frame renderer preparation uses the existing timeout; frame_gone and frame_not_ready are preserved in the response.",
             json!({
                 "script": { "type": "string", "description": "JavaScript expression or script to evaluate." }
             }),
@@ -1319,14 +1319,14 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_FRAME_SWITCH,
             "Frame switch",
-            "Switch to an iframe by selector or snapshot ref, resolved relative to the current frame.",
+            "Switch to an iframe by selector or snapshot ref. Selectors resolve in the current frame; refs use their snapshot context. The next scoped command follows the same browsing frame across renderer changes. Navigation invalidates its document's refs; take a new snapshot. Removal returns frame_gone; expired readiness checks return frame_not_ready. Use frame main to recover, or select through a surviving iframe ref from the latest snapshot.",
             json!({ "frame": { "type": "string" } }),
             &["frame"],
         ),
         tool(
             TOOL_FRAME_MAIN,
             "Frame main",
-            "Switch to the main frame.",
+            "Switch to the main frame, clearing any removed or unavailable iframe selection.",
             json!({}),
             &[],
         ),
@@ -5231,6 +5231,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_preserves_selected_frame_errors() {
+        for (code, message) in [
+            ("frame_gone", "Selected frame is no longer available. Run `frame main` or select the frame again."),
+            ("frame_not_ready", "Selected frame is not ready. Retry the command or run `frame main`."),
+        ] {
+            let result = tool_result_from_run(CliRun {
+                exit_code: Some(1),
+                stdout: json!({"success":false, "error":message, "code":code}).to_string(),
+                stderr: String::new(),
+            });
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["response"]["code"], code);
+            assert_eq!(result["structuredContent"]["response"]["error"], message);
+            assert!(result["content"][0]["text"].as_str().unwrap().contains(message));
+        }
+    }
+
+    #[test]
     fn required_string_rejects_missing_field() {
         let err = required_string(&json!({}), "selector").unwrap_err();
         assert_eq!(err.code, -32602);
@@ -5281,5 +5299,52 @@ mod snapshot_delta_schema_tests {
             crate::commands::parse_command(&args, &flags).unwrap()["delta"],
             true
         );
+    }
+}
+
+#[cfg(test)]
+mod observation_response_tests {
+    use super::*;
+
+    #[test]
+    fn observations_preserve_wire_shapes_and_omit_unchanged_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        for (data, images) in [
+            (json!({"changed":true,"revision":1,"path":path}), 1),
+            (
+                json!({"changed":false,"revision":2,"pixelChangeRatio":0.0,"threshold":0.0}),
+                0,
+            ),
+            (
+                json!({"snapshot":"tree","refs":{},"removedRefs":["@e7"]}),
+                0,
+            ),
+            (
+                json!({"snapshot":{"kind":"unchanged","baseRevision":1,"revision":2}}),
+                0,
+            ),
+        ] {
+            let response = json!({"success":true,"data":data});
+            let result = tool_result_from_run(CliRun {
+                exit_code: Some(0),
+                stdout: response.to_string(),
+                stderr: String::new(),
+            });
+            assert_eq!(result["structuredContent"]["response"], response);
+            assert_eq!(result["isError"], false);
+            assert_eq!(
+                result["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item["type"] == "image")
+                    .count(),
+                images
+            );
+        }
     }
 }

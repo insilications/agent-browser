@@ -52,7 +52,7 @@ agent-browser snapshot --delta     # Full state once, then bounded structural de
 agent-browser snapshot --delta --full # Force full state and refresh baseline
 ```
 
-Delta history is per tab and option set. Responses are `full`, `unchanged`, or `delta`; Selected-frame, document, renderer, URL, or option changes and large deltas return full state. There is one baseline per tab, so returning to a previously selected frame also returns full state. For a delta, apply `changes` (`add`, `remove`, `replace`) to ref metadata. Split the previous tree on newlines, splice `treeChange.lines` at zero-based `startLine`, replacing `deleteCount` lines, then join with newlines. Apply both parts to `baseRevision` before advancing to `revision`; use `--full` if the baseline is unavailable.
+Delta history has one baseline per tab. Responses are `full`, `unchanged`, or `delta`; selected-frame, document, renderer, URL, or option changes and large deltas return full state. Returning to a previously selected frame also returns full state. For a delta, apply `changes` (`add`, `remove`, `replace`) to ref metadata. Split the previous tree on newlines, splice `treeChange.lines` at zero-based `startLine`, replacing `deleteCount` lines, then join with newlines. Apply both parts to `baseRevision` before advancing to `revision`; use `--full` if the baseline is unavailable.
 
 ## Interactions (use @refs from snapshot)
 
@@ -296,9 +296,25 @@ The `frame` command accepts:
 - **Element refs** — `frame @e3` and `frame e3` resolve the ref to an iframe element
 - **CSS selectors** — `frame "#payment-iframe"` finds the iframe by selector
 
-Selection is relative to the current frame. After entering one iframe, the next selector is evaluated in that iframe's document, and a ref from a new scoped snapshot resolves in the CDP session that produced it. This works across nested same-process, cross-origin, and out-of-process iframe boundaries. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid.
+Selection is relative to the current frame. After entering one iframe, the next selector is evaluated in that iframe's document, and a ref from a new scoped snapshot resolves in the CDP session that produced it. This works across nested same-process, cross-origin, and out-of-process iframe boundaries. Surviving DOM elements retain their refs within the same document and renderer. Replaced documents invalidate affected refs without recycling their IDs; take a fresh snapshot after navigation.
 
 `eval` and `wait --fn` run in the current frame's page world, so application globals defined by that frame are visible. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
+
+After you select an iframe, it can navigate to another site and move into or out of a separate renderer process. If the browsing frame keeps its identity, the next scoped command, such as `snapshot`, `eval`, or `click`, resolves its current renderer automatically. You do not need to select the frame again just because Chrome changed its renderer. Readiness checks use the configured command timeout and wait for a usable page context; they do not wait for the application's content to finish loading.
+
+Frame recovery does not preserve element refs from a replaced document. After navigation, take another snapshot in the selected frame and use the refs it returns. Surviving DOM elements retain refs across same-document snapshots, but invalidated IDs are never recycled within the browser session.
+
+If recovery cannot proceed, JSON output and MCP responses include one of these codes:
+
+- `frame_gone`: "Selected frame is no longer available. Run `frame main` or select the frame again."
+
+  The selected iframe or an ancestor was removed. Scoped commands and keyboard input stop; selection never silently falls back to the main document or moves to a replacement iframe with matching attributes. Run `frame main`, select the desired iframe, and take a new snapshot. A surviving iframe-element ref from the latest snapshot can also select a frame explicitly.
+
+- `frame_not_ready`: "Selected frame is not ready. Retry the command or run `frame main`."
+
+  Readiness checks expired without confirming removal. Retry the command, or return to the main document explicitly.
+
+Recovery happens before command dispatch. It does not replay an action or change renderer sessions inside an already-running wait. Navigation or removal after dispatch can still produce an ordinary CDP or element error.
 
 ## Dialogs
 
