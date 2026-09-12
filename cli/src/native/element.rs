@@ -224,6 +224,41 @@ impl RefMap {
         self.map.clear();
     }
 
+    /// Retire the document buckets as well as current refs. A bucket may hold
+    /// refs omitted by the latest scoped snapshot, so iterating live entries
+    /// alone would allow those identities to reappear after replacement.
+    pub(super) fn invalidate_frames(
+        &mut self,
+        page_session: &str,
+        frames: &std::collections::HashSet<Option<String>>,
+    ) {
+        self.documents
+            .retain(|(page, frame), _| page != page_session || !frames.contains(frame));
+        self.map.retain(|_, entry| {
+            !frames.contains(&entry.frame_id)
+                || (entry.frame_id.is_none()
+                    && entry
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|sid| sid != page_session))
+        });
+    }
+
+    /// Backend IDs and durable identities never migrate to another session.
+    pub(super) fn invalidate_session(&mut self, session: &str) {
+        let retired: std::collections::HashSet<_> = self
+            .documents
+            .iter()
+            .filter(|((page, _), document)| page == session || document.session == session)
+            .flat_map(|(_, document)| document.refs.values().cloned())
+            .collect();
+        self.documents
+            .retain(|(page, _), document| page != session && document.session != session);
+        self.map.retain(|id, entry| {
+            !retired.contains(id) && entry.session_id.as_deref() != Some(session)
+        });
+    }
+
     /// Drop all document identities while preserving the monotonic ref counter.
     pub fn invalidate_all_documents(&mut self) {
         self.documents.clear();
