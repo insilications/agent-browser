@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod diff;
 #[allow(dead_code)]
 pub mod element;
+mod frame;
 #[allow(dead_code)]
 pub mod inspect_server;
 #[allow(dead_code)]
