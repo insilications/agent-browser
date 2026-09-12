@@ -368,6 +368,10 @@ agent-browser snapshot -i
 agent-browser frame main     # back to main frame
 ```
 
+The selected browsing frame follows renderer changes before the next scoped command, including navigation into or out of an out-of-process iframe. You do not need to select it again just because its renderer changed. Its new document needs a fresh snapshot: old element refs do not survive document replacement, and snapshot numbers can be reused for different elements.
+
+If the selected frame or an ancestor is removed, scoped commands and keyboard input fail with `frame_gone` instead of silently switching to main. Run `frame main`, select the desired iframe, and snapshot again. `frame_not_ready` means the frame's readiness checks expired without confirming removal; retry or use `frame main`. JSON and MCP responses preserve these codes. Recovery happens before dispatch and does not replay actions or rebind an already-running wait. See [references/commands.md](references/commands.md) for the full frame behavior.
+
 ### Dialogs
 
 `alert` and `beforeunload` are auto-accepted so agents never block. For `confirm` and `prompt`:
@@ -426,7 +430,7 @@ document.querySelectorAll('[data-id]').length
 EOF
 ```
 
-**Cross-origin iframe not accessible** Cross-origin iframes that block accessibility tree access are silently skipped. Use `frame "#iframe"` to switch into them explicitly if the parent opts in, otherwise the iframe's contents aren't available via snapshot — fall back to `eval` in the iframe's origin or use the `--headers` flag to satisfy CORS.
+**Iframe content missing from snapshot** Main-frame snapshots inline one level of iframe content; failed child snapshots can also be silently omitted. Select the iframe with `frame "#iframe"`, then run `snapshot -i`. For deeper nesting, repeat selection inside the current frame. Cross-origin frames do not require parent-page opt-in for CDP selection. If the selected frame is still loading, use a scoped `wait` for its content; see the frame recovery errors above if it changes renderer or is removed.
 
 **WebGPU page renders black in screenshots** Headless Chrome doesn't expose WebGPU by default; three.js `WebGPURenderer` then silently falls back or renders nothing. Relaunch with the `--webgpu` flag, wait for the app's first rendered frame, then screenshot. On Linux install `libvulkan1 mesa-vulkan-drivers` first. If it's still black on Windows/Linux, that's an upstream headless-capture limitation: add `--headed` (needs a logged-in desktop on Windows; on Linux agent-browser starts a private virtual display automatically when Xvfb is installed — never wrap in `xvfb-run`, which kills the display when the CLI exits while the browser lives on). Verify with `agent-browser doctor --webgpu`. See [references/webgpu.md](references/webgpu.md).
 

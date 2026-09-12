@@ -266,9 +266,25 @@ The `frame` command accepts:
 - **Element refs** — `frame @e3` and `frame e3` resolve the ref to an iframe element
 - **CSS selectors** — `frame "#payment-iframe"` finds the iframe by selector
 
-Selection is relative to the current frame. After entering one iframe, the next selector is evaluated in that iframe's document, and a ref from a new scoped snapshot resolves in the CDP session that produced it. This works across nested same-process, cross-origin, and out-of-process iframe boundaries. Each snapshot replaces the ref map, so refs from older snapshots intentionally become invalid.
+Selection is relative to the current frame. After entering one iframe, the next selector is evaluated in that iframe's document, and a ref from a new scoped snapshot resolves in the CDP session that produced it. This works across nested same-process, cross-origin, and out-of-process iframe boundaries. Each snapshot replaces the ref map and can reuse reference numbers for different elements. Use the refs from the latest snapshot.
 
 `eval` and `wait --fn` run in the current frame's page world, so application globals defined by that frame are visible. The internal machinery used to scope operations to a selected frame continues to use an isolated world.
+
+After you select an iframe, it can navigate to another site and move into or out of a separate renderer process. If the browsing frame keeps its identity, the next scoped command, such as `snapshot`, `eval`, or `click`, resolves its current renderer automatically. You do not need to select the frame again just because Chrome changed its renderer. Readiness checks use the configured command timeout and wait for a usable page context; they do not wait for the application's content to finish loading.
+
+Frame recovery does not preserve element refs from a replaced document. After navigation, take another snapshot in the selected frame and use the refs it returns. Each snapshot rebuilds the ref map and can reuse numbers for different elements, so an old `@e7` is not a durable identity.
+
+If recovery cannot proceed, JSON output and MCP responses include one of these codes:
+
+- `frame_gone`: "Selected frame is no longer available. Run `frame main` or select the frame again."
+
+  The selected iframe or an ancestor was removed. Scoped commands and keyboard input stop; selection never silently falls back to the main document or moves to a replacement iframe with matching attributes. Run `frame main`, select the desired iframe, and take a new snapshot. A surviving iframe-element ref from the latest snapshot can also select a frame explicitly.
+
+- `frame_not_ready`: "Selected frame is not ready. Retry the command or run `frame main`."
+
+  Readiness checks expired without confirming removal. Retry the command, or return to the main document explicitly.
+
+Recovery happens before command dispatch. It does not replay an action or change renderer sessions inside an already-running wait. Navigation or removal after dispatch can still produce an ordinary CDP or element error.
 
 ## Dialogs
 
