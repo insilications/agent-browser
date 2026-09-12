@@ -30,6 +30,53 @@ Use `console --json` when object previews or raw CDP arguments matter for an aut
 
 Console messages and uncaught exceptions are collected across the active tab, including its out-of-process iframes. Events from OOPIFs belonging to background tabs are excluded.
 
+## Selected frame recovery
+
+Frame selection can survive a renderer change; element refs from a replaced document cannot. Consider this workflow, where `@e1` is an iframe ref from the latest snapshot:
+
+```bash
+agent-browser frame @e1
+agent-browser snapshot -i
+# Suppose the snapshot assigns @e7 to the desired button.
+agent-browser click @e7
+```
+
+If the iframe moves into or out of another renderer before the snapshot, the snapshot resolves the same browsing frame's current renderer and returns refs for its current document. You do not need to reselect the frame just because its renderer changed. If navigation replaces the document after the snapshot, the old button ref is invalidated. Take another snapshot in the selected frame, then choose the desired element from the new output.
+
+<table>
+  <thead>
+    <tr><th>Code or message</th><th>Meaning</th><th>Recovery</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>frame_gone</code></td><td>The selected iframe or an ancestor was removed. Scoped commands and keyboard input stop before dispatch.</td><td>Run <code>frame main</code>, select the desired iframe, and take a new snapshot.</td></tr>
+    <tr><td><code>frame_not_ready</code></td><td>Readiness checks expired without confirming removal.</td><td>Retry the command, or run <code>frame main</code> to leave the selection explicitly.</td></tr>
+    <tr><td><code>Unknown ref: e7</code></td><td>The ref is no longer in the current map, for example because its document was replaced.</td><td>Take a new snapshot and use the refs it returns.</td></tr>
+  </tbody>
+</table>
+
+The exact frame-error messages are:
+
+```text
+Selected frame is no longer available. Run `frame main` or select the frame again.
+Selected frame is not ready. Retry the command or run `frame main`.
+```
+
+JSON output and MCP responses preserve `frame_gone` and `frame_not_ready` as machine-readable codes. Snapshot numbers can be reused for different elements, so an old ref is not guaranteed to produce an unknown-ref error after another snapshot.
+
+After removal, selection stays invalid until explicit recovery. It never silently switches to main or selects a new iframe with matching HTML attributes. For example, if the page creates a replacement iframe directly under the main document:
+
+```bash
+agent-browser frame main
+agent-browser frame "#embed-iframe"
+agent-browser snapshot -i
+```
+
+For a nested replacement, repeat `frame <selector>` through its parent frames before taking the snapshot. A surviving iframe-element ref from the latest snapshot can also select a frame explicitly. Console, errors, tab management, and explicit top-level navigation remain available for diagnosis and recovery.
+
+Readiness means the frame has a usable page context, not that its application content has finished loading. Use a scoped `wait` for a specific element, text, or page-defined condition. Frame readiness checks and condition polling share the configured wait timeout. Browser target setup already in progress is allowed to finish so a newly attached target is not left paused; the timeout is not a strict wall-clock bound on all browser setup.
+
+Recovery happens before command dispatch. It does not replay an action or switch renderer sessions inside an already-running wait. A frame that changes after dispatch can still cause an ordinary CDP or element error.
+
 ## JavaScript dialogs
 
 ```bash

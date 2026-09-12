@@ -80,7 +80,7 @@ agent-browser click @e12
 
 ## Ref Lifecycle
 
-**IMPORTANT**: Refs are invalidated when the page changes!
+Take a fresh snapshot after navigation or page changes that replace the elements you intend to use. Each snapshot rebuilds the ref map and can reuse a number for a different element, so refs are not permanent identities.
 
 ```bash
 # Get initial snapshot
@@ -186,6 +186,10 @@ agent-browser click @e5
 - Cross-origin iframes that block accessibility tree access are silently skipped
 - Empty iframes or iframes with no interactive content are omitted from the output
 - To scope a snapshot to a single iframe, use `frame @ref` then `snapshot -i`
+
+Frame selection and element refs have separate lifetimes. If a selected iframe navigates into or out of another renderer, the next scoped command resolves the same browsing frame's current renderer automatically. Refs from the replaced document are invalidated. A `click @e7` after navigation can therefore report `Unknown ref: e7` even though frame recovery succeeded. Take a new snapshot in the selected frame and use its refs. A later snapshot can reuse `@e7` for a different element, so do not rely on an unknown-ref error to detect every stale reference.
+
+If the selected frame or an ancestor is removed, scoped snapshots and interactions return `frame_gone`. Run `frame main`, select the desired iframe, and snapshot again. If readiness checks expire without confirming removal, the code is `frame_not_ready`; retry or return to main. Recovery happens before dispatch and does not replay an action already in progress. JSON output and MCP responses preserve both codes.
 
 ## Troubleshooting
 

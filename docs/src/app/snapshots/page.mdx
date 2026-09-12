@@ -105,7 +105,13 @@ agent-browser snapshot -i       # Only elements inside that iframe
 agent-browser frame main        # Return to main frame
 ```
 
-Frame switching is relative. After entering an iframe, a selector or a ref from the new scoped snapshot resolves inside the selected frame, including when nesting crosses an out-of-process iframe boundary. Taking a snapshot replaces the current ref map, so refs from earlier snapshots are intentionally no longer available.
+Frame switching is relative. After entering an iframe, a selector or a ref from the new scoped snapshot resolves inside the selected frame, including when nesting crosses an out-of-process iframe boundary. Taking a snapshot replaces the current ref map and can reuse numbers for different elements. Always use the refs from the latest snapshot.
+
+A selected frame follows its frame ID when its renderer changes. Replacing its document invalidates refs belonging to that document, even when the frame ID survives; take a new snapshot before interacting by ref. Removing the selected frame or an ancestor causes scoped snapshots and interactions to fail with `frame_gone`. Run `frame main`, select the frame again, and take a new snapshot. Frame selection never moves automatically to a replacement iframe with matching attributes.
+
+For example, if an iframe navigates after `snapshot -i` assigns `@e7` to a button, the next `click @e7` can recover the frame but still fail with `Unknown ref: e7`. The button belonged to the previous document. Take another scoped snapshot and choose the desired element from its output. A newer snapshot might reuse `@e7`, so the absence of an unknown-ref error does not prove an old reference still identifies the same element.
+
+If the navigation happened before the snapshot instead, the snapshot can recover the frame and return refs for the new document. This recovery happens before each scoped command; a frame change during an already-running snapshot or interaction can still cause an ordinary CDP or element error. See [selected frame recovery](/debugging#selected-frame-recovery) for the error messages and recovery commands.
 
 ## Best practices
 

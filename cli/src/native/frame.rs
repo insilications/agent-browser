@@ -1,9 +1,172 @@
-//! Frame topology shared by accessibility audits and active-tab session tracking.
-//! Renderer trees supply document ownership; parent-side trees connect OOPIFs
-//! to their containing frames regardless of target query order.
+//! Keep a selected browsing frame usable when Chrome changes its renderer.
+//!
+//! The frame ID identifies the browsing context; its CDP session can change
+//! when navigation moves it into or out of an OOPIF. Lifecycle events mark
+//! ownership as pending, then command preparation resolves that same ID in
+//! the active tab's frame trees. Removal stays invalid until explicit selection
+//! or a reset: falling back to main could send iframe input to an unrelated page.
+//!
+//! Document and renderer replacement invalidate the affected element refs.
+//! Backend node IDs are never transferred to the new session. Recovery happens
+//! before dispatch, so it does not replay actions or rebind an in-flight wait.
 use super::cdp::client::CdpClient;
+use super::cdp::types::CdpEvent;
+use super::element::{FrameContext, RefMap};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+
+pub(super) const FRAME_GONE: &str =
+    "Selected frame is no longer available. Run `frame main` or select the frame again.";
+pub(super) const FRAME_NOT_READY: &str =
+    "Selected frame is not ready. Retry the command or run `frame main`.";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum SelectionStatus {
+    /// The owning session and a default page context have been resolved.
+    /// Application content may still be loading.
+    Ready,
+    /// A renderer swap or missing context needs another ownership check.
+    #[default]
+    Pending,
+    /// The browsing frame was removed; matching HTML attributes cannot revive it.
+    Removed,
+}
+
+/// The selected ID survives swaps; removal is sticky until explicit selection.
+/// The last topology retains ancestry even after Chrome removes the subtree.
+#[derive(Debug, Default)]
+pub(super) struct SelectedFrameState {
+    pub status: SelectionStatus,
+    pub topology: Option<FrameTopology>,
+    /// Invalidates an absence observation if more lifecycle events arrive.
+    pub revision: u64,
+}
+
+impl SelectedFrameState {
+    fn below(&self, frame_id: &str, ancestor: &str) -> bool {
+        frame_id == ancestor
+            || self
+                .topology
+                .as_ref()
+                .is_some_and(|t| t.contains_descendant(frame_id, ancestor))
+    }
+
+    fn owns_event(&self, selected: &FrameContext, frame_id: &str, session: &str) -> bool {
+        if selected.frame_id == frame_id && selected.session_id == session {
+            return true;
+        }
+        let Some(topology) = &self.topology else {
+            return false;
+        };
+        let Some(frame) = topology.frames.get(frame_id) else {
+            return false;
+        };
+        // A remote iframe's removal is also reported by its parent renderer.
+        let owner = if selected.frame_id == frame_id {
+            &selected.session_id
+        } else {
+            &frame.session_id
+        };
+        owner == session
+            || frame
+                .parent_id
+                .as_ref()
+                .and_then(|id| topology.frames.get(id))
+                .is_some_and(|parent| parent.session_id == session)
+    }
+
+    /// Drop refs in the departed document and its descendants. An iframe node
+    /// belongs to its parent document, so a surviving parent-side ref can still
+    /// be used for an explicit `frame @ref` selection.
+    pub fn invalidate_document(&self, refs: &mut RefMap, frame_id: &str) {
+        for (id, entry) in refs.entries_sorted() {
+            if entry
+                .frame_id
+                .as_deref()
+                .is_some_and(|id| self.below(id, frame_id))
+            {
+                refs.remove(&id);
+            }
+        }
+    }
+
+    /// Consume selection events before diagnostic filtering, in wire order.
+    /// Events from other tabs cannot match this selection's recorded ancestry.
+    pub fn apply_event(
+        &mut self,
+        selected: &mut FrameContext,
+        refs: &mut RefMap,
+        event: &CdpEvent,
+    ) {
+        self.revision = self.revision.wrapping_add(1);
+        let params = &event.params;
+        let session = event.session_id.as_deref().unwrap_or_default();
+        match event.method.as_str() {
+            "Target.attachedToTarget" => {
+                let info = &params["targetInfo"];
+                if info["type"] == "iframe" && info["targetId"] == selected.frame_id {
+                    if let Some(sid) = params["sessionId"].as_str() {
+                        if self.status != SelectionStatus::Removed && selected.session_id != sid {
+                            self.invalidate_document(refs, &selected.frame_id);
+                            selected.session_id = sid.to_string();
+                            self.status = SelectionStatus::Pending;
+                        }
+                    }
+                }
+            }
+            "Target.detachedFromTarget" => {
+                if let Some(sid) = params["sessionId"].as_str() {
+                    for (id, entry) in refs.entries_sorted() {
+                        if entry.session_id.as_deref() == Some(sid) {
+                            refs.remove(&id);
+                        }
+                    }
+                    if self.status != SelectionStatus::Removed && selected.session_id == sid {
+                        self.status = SelectionStatus::Pending;
+                    }
+                }
+            }
+            "Page.frameDetached" => {
+                let Some(id) = params["frameId"].as_str() else {
+                    return;
+                };
+                if !self.owns_event(selected, id, session) {
+                    return;
+                }
+                self.invalidate_document(refs, id);
+                if self.below(&selected.frame_id, id) && self.status != SelectionStatus::Removed {
+                    self.status = if params["reason"] == "remove" {
+                        SelectionStatus::Removed
+                    } else {
+                        SelectionStatus::Pending
+                    };
+                }
+            }
+            "Page.frameNavigated" => {
+                let Some(id) = params["frame"]["id"].as_str() else {
+                    return;
+                };
+                if !self.owns_event(selected, id, session) {
+                    return;
+                }
+                let loader = params["frame"]["loaderId"].as_str();
+                let previous_loader = self
+                    .topology
+                    .as_ref()
+                    .and_then(|t| t.frames.get(id))
+                    .and_then(|f| f.loader_id.as_deref());
+                if loader.is_some() && loader != previous_loader {
+                    self.invalidate_document(refs, id);
+                    if self.below(&selected.frame_id, id) && self.status != SelectionStatus::Removed
+                    {
+                        self.status = SelectionStatus::Pending;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct FrameTopology {
@@ -11,6 +174,12 @@ pub(super) struct FrameTopology {
     pub frames: HashMap<String, FrameTarget>,
     /// A failed target query is uncertainty, not evidence of frame removal.
     pub incomplete: bool,
+}
+
+impl FrameTopology {
+    pub fn contains_descendant(&self, frame_id: &str, ancestor: &str) -> bool {
+        frame_reaches_top(frame_id, ancestor, &self.frames)
+    }
 }
 
 pub(super) async fn collect_frame_sessions(
@@ -195,6 +364,169 @@ pub(super) async fn collect_frame_topology(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn setup() -> (SelectedFrameState, FrameContext, RefMap) {
+        let mut frames = HashMap::new();
+        for (id, sid, parent) in [
+            ("top", "page", None),
+            ("outer", "oopif", Some("top")),
+            ("inner", "oopif", Some("outer")),
+        ] {
+            frames.insert(
+                id.to_string(),
+                FrameTarget {
+                    frame_id: id.into(),
+                    session_id: sid.into(),
+                    parent_id: parent.map(str::to_string),
+                    loader_id: Some("old-document".into()),
+                },
+            );
+        }
+        let lifecycle = SelectedFrameState {
+            status: SelectionStatus::Ready,
+            topology: Some(FrameTopology {
+                top_frame_id: "top".into(),
+                frames,
+                incomplete: false,
+            }),
+            revision: 0,
+        };
+        let selected = FrameContext {
+            frame_id: "inner".into(),
+            session_id: "oopif".into(),
+        };
+        let mut refs = RefMap::new();
+        for (id, frame) in [("e1", "outer"), ("e2", "inner")] {
+            refs.add_with_frame(
+                id.into(),
+                Some(7),
+                "button",
+                "shared name",
+                None,
+                super::super::element::RefContext {
+                    frame_id: Some(frame),
+                    session_id: Some("oopif"),
+                },
+            );
+        }
+        (lifecycle, selected, refs)
+    }
+
+    fn event(method: &str, session: &str, params: Value) -> CdpEvent {
+        CdpEvent {
+            method: method.into(),
+            session_id: Some(session.into()),
+            params,
+        }
+    }
+
+    #[test]
+    fn selected_frame_rebinds_without_retargeting_refs() {
+        let (mut state, mut selected, mut refs) = setup();
+        state.apply_event(&mut selected, &mut refs, &event("Target.attachedToTarget", "oopif", json!({"sessionId":"new-owner", "targetInfo":{"type":"iframe", "targetId":"inner"}})));
+        assert_eq!(selected.session_id, "new-owner");
+        assert_eq!(state.status, SelectionStatus::Pending);
+        assert!(
+            refs.get("e1").is_some(),
+            "parent-document iframe ref survives"
+        );
+        assert!(
+            refs.get("e2").is_none(),
+            "old backend IDs must not be rebound"
+        );
+        state.status = SelectionStatus::Ready;
+        state.apply_event(
+            &mut selected,
+            &mut refs,
+            &event(
+                "Target.detachedFromTarget",
+                "page",
+                json!({"sessionId":"old-owner"}),
+            ),
+        );
+        assert_eq!(state.status, SelectionStatus::Ready);
+        state.apply_event(
+            &mut selected,
+            &mut refs,
+            &event(
+                "Page.frameDetached",
+                "old-owner",
+                json!({"frameId":"inner", "reason":"remove"}),
+            ),
+        );
+        assert_eq!(state.status, SelectionStatus::Ready);
+    }
+
+    #[test]
+    fn selected_frame_removal_is_sticky_but_swap_is_not() {
+        let (mut state, mut selected, mut refs) = setup();
+        state.apply_event(
+            &mut selected,
+            &mut refs,
+            &event(
+                "Page.frameDetached",
+                "oopif",
+                json!({"frameId":"inner", "reason":"swap"}),
+            ),
+        );
+        assert_eq!(state.status, SelectionStatus::Pending);
+        state.apply_event(
+            &mut selected,
+            &mut refs,
+            &event(
+                "Page.frameDetached",
+                "page",
+                json!({"frameId":"outer", "reason":"remove"}),
+            ),
+        );
+        assert_eq!(state.status, SelectionStatus::Removed);
+        state.apply_event(
+            &mut selected,
+            &mut refs,
+            &event(
+                "Target.attachedToTarget",
+                "page",
+                json!({"sessionId":"new", "targetInfo":{"type":"iframe", "targetId":"inner"}}),
+            ),
+        );
+        assert_eq!(state.status, SelectionStatus::Removed);
+        assert_eq!(selected.session_id, "oopif");
+    }
+
+    #[test]
+    fn other_tabs_cannot_invalidate_the_selected_frame() {
+        let (mut state, mut selected, mut refs) = setup();
+        for (id, session) in [("other-frame", "page"), ("inner", "background-session")] {
+            state.apply_event(
+                &mut selected,
+                &mut refs,
+                &event(
+                    "Page.frameDetached",
+                    session,
+                    json!({"frameId":id, "reason":"remove"}),
+                ),
+            );
+        }
+        assert_eq!(state.status, SelectionStatus::Ready);
+        assert!(refs.get("e2").is_some());
+    }
+
+    #[test]
+    fn navigation_invalidates_only_replaced_document_refs() {
+        let (mut state, mut selected, mut refs) = setup();
+        state.apply_event(
+            &mut selected,
+            &mut refs,
+            &event(
+                "Page.frameNavigated",
+                "oopif",
+                json!({"frame":{"id":"inner", "loaderId":"new-document"}}),
+            ),
+        );
+        assert!(refs.get("e1").is_some());
+        assert!(refs.get("e2").is_none());
+        assert_eq!(state.status, SelectionStatus::Pending);
+    }
 
     #[test]
     fn frame_topology_prefers_owning_renderer_for_same_process_descendants() {
