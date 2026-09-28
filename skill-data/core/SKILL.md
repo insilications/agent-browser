@@ -31,7 +31,7 @@ agent-browser click @e3         # 3. Act on refs from the snapshot
 agent-browser snapshot -i       # 4. Re-snapshot after any page change
 ```
 
-Refs (`@e1`, `@e2`, ...) can be reused across snapshots. Take a fresh snapshot after navigation or to observe page changes.
+Refs (`@e1`, `@e2`, ...) can be reused across snapshots while their document/renderer identity remain valid. Document/renderer replacement invalidates affected refs without recycling their IDs within the session. Take a fresh snapshot after navigation or to observe page changes.
 
 ## Always use your own session
 
@@ -444,7 +444,7 @@ agent-browser doctor --json              # structured output for programmatic co
 
 ## Troubleshooting
 
-**"Ref not found" / "Element not found: @eN"** Page changed since the snapshot. Run `agent-browser snapshot -i` again, then use the new refs.
+**"Ref not found" / "Element not found: @eN"** The target may have been removed or replaced, its document or renderer may have changed, or the ref may be absent from the current snapshot scope. Run `agent-browser snapshot -i` again and use the refs it reports. Surviving DOM elements in the same document and renderer may retain their existing ref IDs.
 
 **Element exists in the DOM but not in the snapshot** It's probably off-screen or not yet rendered. Try:
 
