@@ -195,8 +195,10 @@ If the selected frame or an ancestor is removed, scoped snapshots and interactio
 
 ### "Ref not found" Error
 
+The target may have been removed or replaced, its document or renderer may have changed, or the ref may be absent from the current snapshot scope. Take a fresh snapshot in the desired scope and use the refs it reports. Surviving DOM elements in the same document and renderer may retain their existing ref IDs.
+
 ```bash
-# Ref may have changed - re-snapshot
+# Refresh the current snapshot scope, then use the refs it reports
 agent-browser snapshot -i
 ```
 
