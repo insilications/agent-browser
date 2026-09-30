@@ -65,6 +65,32 @@ agent-browser get box <sel>           # Get bounding box
 agent-browser get styles <sel>        # Get computed styles
 ```
 
+### Bounding box coordinate spaces
+
+```bash
+agent-browser get box @e1                                   # Existing document-viewport coordinates
+agent-browser get box @e1 --relative-to frame-viewport       # Explicit default
+agent-browser get box @e1 --relative-to top-viewport --json  # Top-level layout viewport
+```
+
+`--relative-to` is a command-specific option for `get box`, not a global setting, configuration key, or environment variable. It accepts only `frame-viewport` and `top-viewport`. Both modes preserve the `x`, `y`, `width`, and `height` fields and normal response metadata. CSS selectors still resolve in the selected document; refs use their recorded frame and renderer, including after `frame main`. Take a fresh snapshot after document replacement.
+
+The default is the element's own document viewport. The opt-in `top-viewport` mode returns axis-aligned bounds enclosing the projected CDP border quad in the top-level page's **layout-viewport CSS pixels**. It supports nested same-process and out-of-process Chrome iframes, borders, asymmetric padding, fractional dimensions, scrolling, and positive axis-aligned 2D scaling (including nonuniform scaling).
+
+Projection requires Chrome/CDP and normal unzoomed viewport geometry. Unsupported iframe mappings (including transformed ancestors with rotation, skew, reflection, perspective, or degenerate sizes), CSS/browser/pinch zoom, displaced visual viewports, missing layout, and unverifiable frame ownership return errors, never frame-local fallback coordinates. A document or renderer change during measurement also fails; retry and refresh refs if the document changed.
+
+Boxes are geometric, not visible or clickable regions: they are not clipped to iframe or viewport boundaries and do not account for occlusion. Offscreen coordinates can be negative. The command does not scroll, focus, dispatch input, change frame selection, or take a snapshot. It performs one measurement attempt without waiting for layout stability. Device-pixel ratio, screenshot scale, and full-page screenshot offsets are separate; do not interpret these CSS coordinates as screenshot pixels. Screenshot, annotation, and input behavior are unchanged.
+
+<table>
+  <thead><tr><th>get box option</th><th>Behavior</th></tr></thead>
+  <tbody>
+    <tr><td><code>--relative-to frame-viewport</code></td><td>Default: target element's document viewport in CSS pixels.</td></tr>
+    <tr><td><code>--relative-to top-viewport</code></td><td>Opt-in Chrome/CDP projection into the top-level layout viewport; unsupported geometry returns an error.</td></tr>
+  </tbody>
+</table>
+
+The MCP tool <code>agent_browser_get_box</code> accepts the same optional enum as <code>relativeTo</code>. Selected-frame <code>frame_gone</code> and <code>frame_not_ready</code> errors retain their normal JSON and MCP codes.
+
 ## Read agent-friendly text
 
 ```bash
@@ -289,6 +315,8 @@ agent-browser snapshot --delta --full
 `snapshot --delta` returns `full`, `unchanged`, or incremental updates per tab and option set. Selected-frame, document, renderer, URL, or option changes and large deltas return full state. There is one baseline per tab, so returning to a previously selected frame also returns full state; `--full` resets the baseline. Apply a delta’s `changes` to ref metadata and `treeChange` to the previous tree: split on newlines, replace `deleteCount` lines at zero-based `startLine` with `lines`, then rejoin. Apply both to `baseRevision` before advancing to `revision`.
 
 ### Iframe support
+
+For top-level CSS coordinates of an iframe element, use `get box <sel> --relative-to top-viewport`. This does not change selector scope or frame selection. See [Bounding box coordinate spaces](#bounding-box-coordinate-spaces) for supported mappings and screenshot-scale distinctions.
 
 Iframes are detected automatically during snapshots. `Iframe` nodes are resolved and their content is inlined beneath the iframe element in the snapshot output. Refs assigned to elements inside iframes carry frame context, so `click`, `fill`, and other interactions work without manually switching frames.
 
