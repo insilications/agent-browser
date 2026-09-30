@@ -8651,12 +8651,33 @@ async fn handle_tap(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
 }
 
 async fn handle_boundingbox(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let top_viewport = match cmd.get("relativeTo") {
+        None => false,
+        Some(Value::String(space)) if space == "frame-viewport" => false,
+        Some(Value::String(space)) if space == "top-viewport" => true,
+        _ => return Err("relativeTo must be frame-viewport or top-viewport".into()),
+    };
+    if top_viewport && (state.engine != "chrome" || state.browser.is_none()) {
+        return Err("Top-viewport bounding boxes require the Chrome/CDP backend".into());
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+
+    if top_viewport {
+        return super::geometry::top_viewport_box(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            state.active_frame.as_ref(),
+            &state.iframe_sessions,
+        )
+        .await;
+    }
 
     let bbox = super::element::get_element_bounding_box(
         &mgr.client,
@@ -14110,6 +14131,7 @@ mod tests {
         for command in [
             json!({"action":"evaluate"}),
             json!({"action":"snapshot"}),
+            json!({"action":"boundingbox", "relativeTo":"top-viewport"}),
             json!({"action":"find"}),
             json!({"action":"click", "selector":"@e1"}),
             json!({"action":"frame", "selector":"iframe"}),
@@ -14141,6 +14163,30 @@ mod tests {
             assert_eq!(response["success"], false);
             assert_eq!(response["code"], code);
             assert_eq!(response["error"], message);
+        }
+    }
+
+    #[tokio::test]
+    async fn top_viewport_box_requires_chrome_and_valid_coordinate_space() {
+        let mut state = DaemonState::new();
+        for engine in ["lightpanda", "safari"] {
+            state.engine = engine.into();
+            assert!(handle_boundingbox(
+                &json!({"selector":"#button","relativeTo":"top-viewport"}),
+                &mut state
+            )
+            .await
+            .unwrap_err()
+            .contains("Chrome/CDP"));
+        }
+        for invalid in [json!(false), json!("page"), Value::Null] {
+            assert!(handle_boundingbox(
+                &json!({"selector":"#button","relativeTo":invalid}),
+                &mut state
+            )
+            .await
+            .unwrap_err()
+            .contains("relativeTo"));
         }
     }
 

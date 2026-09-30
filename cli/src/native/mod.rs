@@ -17,6 +17,7 @@ pub mod diff;
 #[allow(dead_code)]
 pub mod element;
 mod frame;
+mod geometry;
 #[allow(dead_code)]
 pub mod inspect_server;
 #[allow(dead_code)]

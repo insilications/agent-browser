@@ -10885,6 +10885,8 @@ async fn e2e_vitals_reports_metrics() {
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
 
+mod geometry;
+
 async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

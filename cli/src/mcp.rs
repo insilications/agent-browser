@@ -1065,8 +1065,8 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_GET_BOX,
             "Get box",
-            "Get an element bounding box.",
-            json!({ "selector": selector_schema() }),
+            "Get an element border bounding box in CSS pixels. Defaults to the element's document viewport. Opt into top-viewport for read-only projection into the top-level layout viewport through nested Chrome iframes, including positive axis-aligned scaling. Iframe rotation, skew, reflection and perspective, or any zoom, are unsupported. Bounds are not clipped or visibility-tested; screenshot pixels may use a different scale. Ref provenance and selected-frame recovery are preserved.",
+            json!({ "selector": selector_schema(), "relativeTo": { "type": "string", "enum": ["frame-viewport", "top-viewport"], "description": "Output coordinate space, not selector scope. Default: frame-viewport." } }),
             &["selector"],
         ),
         tool(
@@ -2247,7 +2247,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_GET_VALUE => call_get_selector(arguments, "value"),
         TOOL_GET_ATTR => call_get_attr(arguments),
         TOOL_GET_COUNT => call_get_selector(arguments, "count"),
-        TOOL_GET_BOX => call_get_selector(arguments, "box"),
+        TOOL_GET_BOX => call_cli_tool(arguments, get_box_command_args(arguments)?, None),
         TOOL_GET_STYLES => call_get_selector(arguments, "styles"),
         TOOL_GET_URL => call_cli_tool(arguments, vec!["get".to_string(), "url".to_string()], None),
         TOOL_GET_TITLE => call_cli_tool(
@@ -2836,6 +2836,19 @@ fn call_get_selector(arguments: &Value, what: &str) -> Result<Value, ProtocolErr
         vec!["get".to_string(), what.to_string(), selector],
         None,
     )
+}
+
+/// Keep coordinate-space validation in the canonical CLI parser.
+fn get_box_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let mut args = vec![
+        "get".into(),
+        "box".into(),
+        required_string(arguments, "selector")?,
+    ];
+    if let Some(space) = optional_string(arguments, "relativeTo")? {
+        args.extend(["--relative-to".into(), space]);
+    }
+    Ok(args)
 }
 
 fn call_get_attr(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -5305,6 +5318,51 @@ mod snapshot_delta_schema_tests {
 #[cfg(test)]
 mod observation_response_tests {
     use super::*;
+
+    #[test]
+    fn get_box_coordinate_spaces_delegate_to_cli_and_preserve_shape() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_GET_BOX)
+            .unwrap();
+        assert_eq!(
+            schema["inputSchema"]["properties"]["relativeTo"]["enum"],
+            json!(["frame-viewport", "top-viewport"])
+        );
+        for space in [
+            None,
+            Some("frame-viewport"),
+            Some("top-viewport"),
+            Some("invalid"),
+        ] {
+            let mut arguments = json!({"selector":"@e1"});
+            if let Some(space) = space {
+                arguments["relativeTo"] = json!(space);
+            }
+            let args = get_box_command_args(&arguments).unwrap();
+            let parsed = crate::commands::parse_command(&args, &crate::flags::parse_flags(&args));
+            if space == Some("invalid") {
+                assert!(parsed.is_err());
+                continue;
+            }
+            let parsed = parsed.unwrap();
+            assert_eq!(parsed["action"], "boundingbox");
+            assert_eq!(parsed.get("relativeTo").and_then(Value::as_str), space);
+        }
+        let response = json!({"success":true,"data":{"x":305.,"y":245.,"width":80.,"height":40.}});
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(0),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(result["isError"], false);
+        assert!(result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "image"));
+    }
 
     #[test]
     fn observations_preserve_wire_shapes_and_omit_unchanged_images() {

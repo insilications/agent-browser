@@ -2926,11 +2926,51 @@ fn parse_get(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             Ok(json!({ "id": id, "action": "count", "selector": sel }))
         }
         Some("box") => {
-            let sel = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
-                context: "get box".to_string(),
-                usage: "get box <selector>",
+            const USAGE: &str = "get box <selector> [--relative-to frame-viewport|top-viewport]";
+            let mut selector = None;
+            let mut relative_to = None;
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i] {
+                    "--relative-to" => {
+                        let value =
+                            rest.get(i + 1)
+                                .ok_or_else(|| ParseError::MissingArguments {
+                                    context: "get box --relative-to".into(),
+                                    usage: USAGE,
+                                })?;
+                        if relative_to.is_some()
+                            || !matches!(*value, "frame-viewport" | "top-viewport")
+                        {
+                            return Err(ParseError::InvalidValue {
+                                message: "Specify --relative-to once, with frame-viewport or top-viewport".into(),
+                                usage: USAGE,
+                            });
+                        }
+                        relative_to = Some(*value);
+                        i += 1;
+                    }
+                    value if !value.starts_with('-') && selector.is_none() => {
+                        selector = Some(value)
+                    }
+                    value => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unexpected argument for get box: {value}"),
+                            usage: USAGE,
+                        })
+                    }
+                }
+                i += 1;
+            }
+            let selector = selector.ok_or_else(|| ParseError::MissingArguments {
+                context: "get box".into(),
+                usage: USAGE,
             })?;
-            Ok(json!({ "id": id, "action": "boundingbox", "selector": sel }))
+            let mut command = json!({ "id": id, "action": "boundingbox", "selector": selector });
+            if let Some(space) = relative_to {
+                command["relativeTo"] = json!(space);
+            }
+            Ok(command)
         }
         Some("styles") => {
             let sel = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
@@ -5533,6 +5573,46 @@ mod tests {
     }
 
     // === Error message tests ===
+
+    #[test]
+    fn test_get_box_coordinate_spaces() {
+        for selector in ["#button", "@e1", "e1"] {
+            let plain =
+                parse_command(&args(&format!("get box {selector}")), &default_flags()).unwrap();
+            assert_eq!(plain["action"], "boundingbox");
+            assert_eq!(plain["selector"], selector);
+            assert!(plain.get("relativeTo").is_none());
+            for space in ["frame-viewport", "top-viewport"] {
+                for command in [
+                    format!("get box {selector} --relative-to {space}"),
+                    format!("--json get box --relative-to {space} {selector}"),
+                ] {
+                    let input = args(&command);
+                    let parsed = parse_command(
+                        &crate::flags::clean_args(&input),
+                        &crate::flags::parse_flags(&input),
+                    )
+                    .unwrap();
+                    assert_eq!(parsed["relativeTo"], space);
+                    assert_eq!(parsed["selector"], selector);
+                }
+            }
+        }
+        for command in [
+            "get box",
+            "get box @e1 --relative-to",
+            "get box @e1 --relative-to page",
+            "get box --relative-to top-viewport",
+            "get box @e1 --relative-to top-viewport --relative-to frame-viewport",
+            "get box @e1 --unknown",
+            "get box @e1 extra",
+        ] {
+            assert!(
+                parse_command(&args(command), &default_flags()).is_err(),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn test_get_missing_subcommand() {

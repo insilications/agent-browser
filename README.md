@@ -197,6 +197,22 @@ agent-browser get box <sel>           # Get bounding box
 agent-browser get styles <sel>        # Get computed styles
 ```
 
+### Bounding box coordinate spaces
+
+```bash
+agent-browser get box @e1                                   # Existing document-viewport coordinates
+agent-browser get box @e1 --relative-to frame-viewport       # Explicit default
+agent-browser get box @e1 --relative-to top-viewport --json  # Top-level layout viewport
+```
+
+`--relative-to` is a command-specific option for `get box`, not a global setting, configuration key, or environment variable. It accepts only `frame-viewport` and `top-viewport`. Both modes preserve the `x`, `y`, `width`, and `height` fields and normal response metadata. CSS selectors still resolve in the selected document; refs use their recorded frame and renderer, including after `frame main`. Take a fresh snapshot after document replacement.
+
+The default is the element's own document viewport. The opt-in `top-viewport` mode returns axis-aligned bounds enclosing the projected CDP border quad in the top-level page's **layout-viewport CSS pixels**. It supports nested same-process and out-of-process Chrome iframes, borders, asymmetric padding, fractional dimensions, scrolling, and positive axis-aligned 2D scaling (including nonuniform scaling).
+
+Projection requires Chrome/CDP and normal unzoomed viewport geometry. Unsupported iframe mappings (including transformed ancestors with rotation, skew, reflection, perspective, or degenerate sizes), CSS/browser/pinch zoom, displaced visual viewports, missing layout, and unverifiable frame ownership return errors, never frame-local fallback coordinates. A document or renderer change during measurement also fails; retry and refresh refs if the document changed.
+
+Boxes are geometric, not visible or clickable regions: they are not clipped to iframe or viewport boundaries and do not account for occlusion. Offscreen coordinates can be negative. The command does not scroll, focus, dispatch input, change frame selection, or take a snapshot. It performs one measurement attempt without waiting for layout stability. Device-pixel ratio, screenshot scale, and full-page screenshot offsets are separate; do not interpret these CSS coordinates as screenshot pixels. Screenshot, annotation, and input behavior are unchanged.
+
 ### Read Agent-Friendly Text
 
 ```bash
@@ -398,6 +414,8 @@ Tabs opened through `tab new` or `click --new-tab` inherit the session's user ag
 Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a discarded tab has no renderer to drive. Reactivation reloads the discarded page and resets its unsaved state, and the switch result reports `"revived": true`. A tab whose page is paused by a JavaScript dialog is alive rather than discarded, so the switch leaves it untouched and reports `"dialogBlocked": true`; resolve the dialog with `dialog accept` or `dialog dismiss` before interacting. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
 
 ### Frames
+
+Use `get box <sel> --relative-to top-viewport` for top-level CSS coordinates of an element in the selected iframe. The default remains document-local; see [Bounding box coordinate spaces](#bounding-box-coordinate-spaces) for projection limits.
 
 ```bash
 agent-browser frame <sel>             # Switch by CSS selector in the current frame
@@ -1088,6 +1106,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--cdp <port\|url>` | Connect via Chrome DevTools Protocol (port or WebSocket URL) |
 | `--auto-connect` | Auto-discover and connect to running Chrome (or `AGENT_BROWSER_AUTO_CONNECT` env) |
 | `--pin-tab` | Pin the session to its bound tab; fail with `tab_gone` instead of falling back to another tab (or `AGENT_BROWSER_PIN_TAB` env) |
+| `--relative-to <space>` | `get box` only: `frame-viewport` (default) or `top-viewport` (Chrome/CDP). No config or environment setting. |
 | `--no-pin-tab` | Disable a sticky pin previously enabled with `--pin-tab` |
 | `--color-scheme <scheme>` | Color scheme: `dark`, `light`, `no-preference` (or `AGENT_BROWSER_COLOR_SCHEME` env) |
 | `--download-path <path>` | Default download directory (or `AGENT_BROWSER_DOWNLOAD_PATH` env) |

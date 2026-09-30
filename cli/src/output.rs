@@ -2361,9 +2361,23 @@ Subcommands:
   title                      Get page title
   url                        Get current URL
   count <selector>           Count matching elements
-  box <selector>             Get bounding box (x, y, width, height)
+  box <selector> [--relative-to <space>]  Get bounding box (x, y, width, height)
   styles <selector>          Get computed styles of elements
   cdp-url                    Get Chrome DevTools Protocol WebSocket URL
+
+Box Options (get box only; no config or environment setting):
+  --relative-to <space>  frame-viewport (default) or top-viewport
+
+Default boxes use the element's own document viewport. Top-viewport returns
+axis-aligned bounds of its projected border quad in top-level layout-viewport
+CSS pixels. Selectors still use the selected document; refs use recorded frame
+provenance, even after frame main. Take fresh refs after document replacement.
+Chrome/CDP only: nested frames, borders, padding, scroll and positive axis-aligned
+2D scaling are supported. Iframe rotation, skew, reflection, perspective,
+degenerate mappings, CSS/browser/pinch zoom and displaced visual viewports fail
+explicitly. No clipping, occlusion test, scrolling, focus or selection changes.
+CSS pixels are not screenshot/device pixels or full-page screenshot coordinates.
+This is one measurement attempt, not an atomic snapshot of an animating page.
 
 Global Options:
   --json               Output as JSON
@@ -2378,6 +2392,7 @@ Examples:
   agent-browser get url
   agent-browser get count "li.item"
   agent-browser get box "#header"
+  agent-browser get box @e1 --relative-to top-viewport
   agent-browser get styles "button"
   agent-browser get styles @e1
 "##
@@ -4053,6 +4068,7 @@ Options:
   --device <name>            iOS device name (e.g., "iPhone 15 Pro")
   --json                     JSON output
   --annotate                 Annotated screenshot with numbered labels and legend
+  --relative-to <space>      get box only: frame-viewport (default) or top-viewport (Chrome/CDP)
   --screenshot-dir <path>    Default screenshot output directory (or AGENT_BROWSER_SCREENSHOT_DIR)
   --screenshot-quality <n>   JPEG quality 0-100; ignored for PNG (or AGENT_BROWSER_SCREENSHOT_QUALITY)
   --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)

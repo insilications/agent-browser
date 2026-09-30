@@ -1512,6 +1512,9 @@ pub async fn set_element_value(
     Ok(())
 }
 
+/// Legacy/default get-box space: the element's own document viewport, even
+/// when resolved through a ref while another document is selected. Top-level
+/// projection is deliberately separate in `geometry` and never changes this path.
 pub async fn get_element_bounding_box(
     client: &CdpClient,
     session_id: &str,
