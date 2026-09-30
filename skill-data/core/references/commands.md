@@ -97,6 +97,24 @@ agent-browser get box @e1         # Get bounding box
 agent-browser get styles @e1      # Get computed styles (font, color, bg, etc.)
 ```
 
+### Bounding box coordinate spaces
+
+```bash
+agent-browser get box @e1                                   # Existing document-viewport coordinates
+agent-browser get box @e1 --relative-to frame-viewport       # Explicit default
+agent-browser get box @e1 --relative-to top-viewport --json  # Top-level layout viewport
+```
+
+`--relative-to` is a command-specific option for `get box`, not a global setting, configuration key, or environment variable. It accepts only `frame-viewport` and `top-viewport`. Both modes preserve the `x`, `y`, `width`, and `height` fields and normal response metadata. CSS selectors still resolve in the selected document; refs use their recorded frame and renderer, including after `frame main`. Take a fresh snapshot after document replacement.
+
+The default is the element's own document viewport. The opt-in `top-viewport` mode returns axis-aligned bounds enclosing the projected CDP border quad in the top-level page's **layout-viewport CSS pixels**. It supports nested same-process and out-of-process Chrome iframes, borders, asymmetric padding, fractional dimensions, scrolling, and positive axis-aligned 2D scaling (including nonuniform scaling).
+
+Projection requires Chrome/CDP and normal unzoomed viewport geometry. Unsupported iframe mappings (including transformed ancestors with rotation, skew, reflection, perspective, or degenerate sizes), CSS/browser/pinch zoom, displaced visual viewports, missing layout, and unverifiable frame ownership return errors, never frame-local fallback coordinates. A document or renderer change during measurement also fails; retry and refresh refs if the document changed.
+
+Boxes are geometric, not visible or clickable regions: they are not clipped to iframe or viewport boundaries and do not account for occlusion. Offscreen coordinates can be negative. The command does not scroll, focus, dispatch input, change frame selection, or take a snapshot. It performs one measurement attempt without waiting for layout stability. Device-pixel ratio, screenshot scale, and full-page screenshot offsets are separate; do not interpret these CSS coordinates as screenshot pixels. Screenshot, annotation, and input behavior are unchanged.
+
+The MCP tool `agent_browser_get_box` accepts the same optional enum as `relativeTo` and delegates through the CLI parser. Selected-frame `frame_gone` and `frame_not_ready` errors retain their normal JSON and MCP codes.
+
 ## Check State
 
 ```bash

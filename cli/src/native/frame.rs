@@ -206,7 +206,7 @@ pub(super) async fn collect_frame_sessions(
     Ok((topology.top_frame_id, frames))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FrameTarget {
     pub frame_id: String,
     pub session_id: String,

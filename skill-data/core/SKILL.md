@@ -416,6 +416,14 @@ The selected browsing frame follows renderer changes before the next scoped comm
 
 If the selected frame or an ancestor is removed, scoped commands and keyboard input fail with `frame_gone` instead of silently switching to main. Run `frame main`, select the desired iframe, and snapshot again. `frame_not_ready` means the frame's readiness checks expired without confirming removal; retry or use `frame main`. JSON and MCP responses preserve these codes. Recovery happens before dispatch and does not replay actions or rebind an already-running wait. See [references/commands.md](references/commands.md) for the full frame behavior.
 
+For screenshot or overlay analysis, request top-level CSS coordinates without changing selection:
+
+```bash
+agent-browser get box @e5 --relative-to top-viewport
+```
+
+Omitting `--relative-to` (or using `frame-viewport`) keeps document-local boxes. Projection uses ref provenance even after `frame main`. It requires Chrome/CDP and supports nested frames with positive axis-aligned scaling, not iframe rotation/skew/reflection/perspective or zoom. Results are unclipped geometric bounds in layout-viewport CSS pixels, not screenshot pixels or clickable regions. Unsupported or unavailable geometry fails explicitly. The command does not scroll or change selection; see [coordinate-space details](references/commands.md#bounding-box-coordinate-spaces).
+
 ### Dialogs
 
 `alert` and `beforeunload` are auto-accepted so agents never block. For `confirm` and `prompt`:
