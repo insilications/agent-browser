@@ -5349,7 +5349,10 @@ mod observation_response_tests {
             assert_eq!(parsed["action"], "boundingbox");
             assert_eq!(parsed.get("relativeTo").and_then(Value::as_str), space);
         }
-        let response = json!({"success":true,"data":{"x":305.,"y":245.,"width":80.,"height":40.}});
+        // Fractional iframe padding affects the origin, not the child's size.
+        // MCP must preserve the canonical CLI's fractional coordinates as-is.
+        let response =
+            json!({"success":true,"data":{"x":344.484375,"y":284.484375,"width":80.,"height":40.}});
         let result = tool_result_from_run(CliRun {
             exit_code: Some(0),
             stdout: response.to_string(),

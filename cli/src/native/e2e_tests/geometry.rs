@@ -266,6 +266,79 @@ async fn e2e_box_top_viewport_layout_refs_scroll_and_pixels() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_box_top_viewport_fractional_border_box_padding() {
+    let (_env, _dir) = binding_test_env();
+    let (port, server) = start_a11y_frame_server().await;
+    let mut state = DaemonState::new();
+    command(
+        &mut state,
+        json!({"action":"launch","headless":true,"args":["--site-per-process"]}),
+    )
+    .await;
+    for host in ["127.0.0.1", "localhost"] {
+        let outer = scene(&mut state, port, host).await;
+        let top_sid = state.browser.as_ref().unwrap().active_session_id().unwrap();
+        assert_eq!(outer.session_id == top_sid, host == "127.0.0.1");
+        let reference = button_ref(&mut state).await;
+        // Used padding is fractional, but differs from computed CSS padding.
+        // The second case leaves only 1/32 CSS px of content on each axis.
+        for (style, inset_x, inset_y) in [
+            (
+                "width:100px;height:100px;border:0;padding:49.499px",
+                49.484375,
+                49.484375,
+            ),
+            (
+                "width:1px;height:1px;border:0;padding:0.499px",
+                0.484375,
+                0.484375,
+            ),
+            (
+                "width:100.5px;height:80.5px;border:solid;border-width:1px 2px 3px 4px;padding:37.999px 46.499px",
+                50.484375,
+                38.984375,
+            ),
+            // Percentage padding is already layout-rounded in computed style;
+            // truncating its serialized value again would also invent scale.
+            (
+                "width:98.0625px;height:98.0625px;border:0;padding:3.829345703125%",
+                49.015625,
+                49.015625,
+            ),
+        ] {
+            for (sx, sy) in [(1., 1.), (1.25, 1.5)] {
+                evaluate(
+                    &state,
+                    None,
+                    &format!("document.querySelector('#outer').style.cssText='position:absolute;left:240px;top:160px;box-sizing:border-box;transform-origin:0 0;transform:scale({sx},{sy});{style}'"),
+                )
+                .await;
+                // Inner iframe origin (35,45) plus button origin (20,30).
+                let expected = [
+                    240. + (inset_x + 55.) * sx,
+                    160. + (inset_y + 75.) * sy,
+                    80. * sx,
+                    40. * sy,
+                ];
+                expect_box(&mut state, BUTTON, Some("top-viewport"), expected).await;
+                expect_box(&mut state, &reference, Some("top-viewport"), expected).await;
+            }
+        }
+        // A positive border box is not enough when padding consumes all content.
+        evaluate(&state, None, "document.querySelector('#outer').style.cssText='width:100px;height:100px;box-sizing:border-box;border:0;padding:50px'").await;
+        let response = Box::pin(execute_command(
+            &json!({"action":"boundingbox","selector":BUTTON,"relativeTo":"top-viewport"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(response["success"], false, "zero content size: {response}");
+    }
+    command(&mut state, json!({"action":"close"})).await;
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_box_top_viewport_renderer_replacement_and_removal() {
     let (_env, _dir) = binding_test_env();
     let (port, server) = start_a11y_frame_server().await;

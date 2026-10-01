@@ -72,7 +72,7 @@ struct AxisAlignedMap {
 }
 
 impl AxisAlignedMap {
-    fn from_content(quad: Quad, width: f64, height: f64) -> Result<Self, String> {
+    fn from_quad(quad: Quad, width: f64, height: f64) -> Result<Self, String> {
         let [a, b, c, d] = quad.0;
         if !width.is_finite()
             || !height.is_finite()
@@ -94,6 +94,24 @@ impl AxisAlignedMap {
         };
         if !map.sx.is_finite() || !map.sy.is_finite() {
             return Err(unavailable("nonfinite iframe scale"));
+        }
+        Ok(map)
+    }
+
+    fn from_box_model(model: &Value, dimensions: &Value) -> Result<Self, String> {
+        let width = number(&dimensions["width"])?;
+        let height = number(&dimensions["height"])?;
+        let content = Quad::read(&model["content"])?;
+        // Always validate the content quad, including its positive size, and
+        // use its origin for the child viewport regardless of box-sizing.
+        let mut map = Self::from_quad(content, width, height)?;
+        if dimensions["boxSizing"] == "border-box" {
+            // Compare like boxes to recover scale. Subtracting computed CSS
+            // padding from a used border size mixes unquantized and layout-
+            // rounded values, inventing scale when the content box is small.
+            let border = Self::from_quad(Quad::read(&model["border"])?, width, height)?;
+            map.sx = border.sx;
+            map.sy = border.sy;
         }
         Ok(map)
     }
@@ -164,11 +182,11 @@ fn viewport_supported(metrics: &Value) -> Result<(), String> {
     Ok(())
 }
 
-// Placement comes from CDP, not parsed CSS matrices. Read fractional used
-// content sizes here: BoxModel.width/height are rounded offset dimensions and
-// child innerWidth/innerHeight are rounded too. Inspect composed ancestors so
-// a rotated wrapper, shadow host, individual transform, or perspective cannot
-// be mistaken for a supported embedding merely because its quad looks square.
+// Placement comes from CDP, not parsed CSS matrices. Read fractional used sizes
+// in their CSS sizing box: BoxModel.width/height and child innerWidth/innerHeight
+// are rounded. Inspect composed ancestors so a rotated wrapper, shadow host,
+// individual transform, or perspective cannot be mistaken for a supported
+// embedding merely because its quad looks square.
 const METRICS_JS: &str = r#"function(embedding) {
     if (!this.isConnected || !this.ownerDocument.defaultView)
         return {error:'element or iframe owner is detached'};
@@ -202,14 +220,10 @@ const METRICS_JS: &str = r#"function(embedding) {
     if (!embedding) return {};
     const s = win.getComputedStyle(this);
     const px = value => /^-?(?:\d+(?:\.\d*)?|\.\d+)px$/.test(value) ? parseFloat(value) : NaN;
-    let width = px(s.width), height = px(s.height);
-    if (s.boxSizing === 'border-box') {
-        width -= px(s.borderLeftWidth) + px(s.borderRightWidth) + px(s.paddingLeft) + px(s.paddingRight);
-        height -= px(s.borderTopWidth) + px(s.borderBottomWidth) + px(s.paddingTop) + px(s.paddingBottom);
-    }
+    const width = px(s.width), height = px(s.height);
     if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0)
-        return {error:'iframe has no measurable positive content size'};
-    return {width,height};
+        return {error:'iframe has no measurable positive size'};
+    return {width,height,boxSizing:s.boxSizing};
 }"#;
 
 async fn element_metrics(
@@ -326,13 +340,9 @@ pub(super) async fn top_viewport_box(
             handles.push((parent.session_id.clone(), owner_object.clone()));
             let dimensions =
                 element_metrics(client, &parent.session_id, &owner_object, true).await?;
-            let content = Quad::read(
-                &box_model(client, &parent.session_id, &owner_object).await?["content"],
-            )?;
-            let mapping = AxisAlignedMap::from_content(
-                content,
-                number(&dimensions["width"])?,
-                number(&dimensions["height"])?,
+            let mapping = AxisAlignedMap::from_box_model(
+                &box_model(client, &parent.session_id, &owner_object).await?,
+                &dimensions,
             )?;
             if child.session_id != parent.session_id {
                 quad = mapping.apply(quad)?;
@@ -372,13 +382,13 @@ mod tests {
     #[test]
     fn projection_composes_corners_and_keeps_fractional_css_units() {
         let target = quad([20.25, 30.5, 100.25, 30.5, 100.25, 70.5, 20.25, 70.5]);
-        let inner = AxisAlignedMap::from_content(
+        let inner = AxisAlignedMap::from_quad(
             quad([35., 45., 735., 45., 735., 545., 35., 545.]),
             350.,
             250.,
         )
         .unwrap();
-        let outer = AxisAlignedMap::from_content(
+        let outer = AxisAlignedMap::from_quad(
             quad([250., 170., 1250., 170., 1250., 570., 250., 570.]),
             500.,
             400.,
@@ -389,7 +399,7 @@ mod tests {
             serde_json::to_value(result).unwrap(),
             json!({"x":401.,"y":276.,"width":320.,"height":80.})
         );
-        let fractional = AxisAlignedMap::from_content(
+        let fractional = AxisAlignedMap::from_quad(
             quad([274., 185.75, 899.625, 185.75, 899.625, 786.5, 274., 786.5]),
             500.5,
             400.5,
@@ -408,10 +418,10 @@ mod tests {
             [0., 0., 0., 0., 0., 100., 0., 100.],       // degenerate
             [0., 0., 0., 100., -100., 100., -100., 0.], // rotation
         ] {
-            assert!(AxisAlignedMap::from_content(quad(values), 100., 100.).is_err());
+            assert!(AxisAlignedMap::from_quad(quad(values), 100., 100.).is_err());
         }
         for width in [0., -1., f64::NAN, f64::INFINITY] {
-            assert!(AxisAlignedMap::from_content(
+            assert!(AxisAlignedMap::from_quad(
                 quad([0., 0., 100., 0., 100., 100., 0., 100.]),
                 width,
                 100.
@@ -522,8 +532,12 @@ mod tests {
                         let value = match params["objectId"].as_str().unwrap() {
                             "target" => json!({}),
                             _ if failure == "style" => json!({"error":"unsupported style"}),
-                            "inner-owner" => json!({"width":350,"height":250}),
-                            "outer-owner" => json!({"width":500,"height":400}),
+                            "inner-owner" => {
+                                json!({"width":350,"height":250,"boxSizing":"content-box"})
+                            }
+                            "outer-owner" => {
+                                json!({"width":520,"height":420,"boxSizing":"border-box"})
+                            }
                             _ => panic!("unexpected object"),
                         };
                         json!({"result":{"type":"object","value":value}})
@@ -540,7 +554,7 @@ mod tests {
                             json!({"model":{"content":[285,215,635,215,635,465,285,465]}})
                         }
                         "outer-owner" => {
-                            json!({"model":{"content":[250,170,750,170,750,570,250,570]}})
+                            json!({"model":{"content":[250,170,750,170,750,570,250,570],"border":[240,160,760,160,760,580,240,580]}})
                         }
                         _ => panic!("unexpected object"),
                     },
