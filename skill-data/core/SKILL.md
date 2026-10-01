@@ -316,6 +316,7 @@ agent-browser screenshot                        # temp path, printed on stdout
 agent-browser screenshot page.png               # specific path
 agent-browser screenshot --full full.png        # full scroll height
 agent-browser screenshot --annotate map.png     # numbered labels + legend keyed to snapshot refs
+agent-browser screenshot @e1 --annotate crop.png # Chrome composited crop; CSS metadata stays fractional
 agent-browser screenshot --if-changed           # recommended: skip unchanged images to save tokens
 agent-browser screenshot --threshold 0.01       # ignore changes affecting at most 1% of pixels
 ```
@@ -324,7 +325,7 @@ Prefer `--if-changed` for repeated captures: skipping unchanged images is the mo
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 
-`--annotate` is designed for multimodal models: each label `[N]` maps to ref `@eN`.
+`--annotate` is designed for multimodal models: each label `[N]` maps to a refreshed, immediately usable ref `@eN`. Chrome projects labels through nested iframes and supports annotated selector/ref crops without changing frame selection. Discovery still follows the selected document’s interactive snapshot, not a recursive frame scan. JSON boxes are fractional, full geometric bounds in capture-relative CSS pixels; clipping affects drawing, not dimensions, and DPR does not multiply metadata. `--full` takes precedence over a selector crop while retaining selector-overlap filtering. Unsupported projection or changes during capture fail explicitly; refresh refs after document replacement and retry when appropriate. Lightpanda keeps legacy behavior; WebDriver annotations remain unsupported. See [annotated capture coordinates](references/commands.md#annotated-capture-coordinates) for capture origins, clipping limits, and failure behavior.
 
 ### Handle multiple pages via tabs
 
