@@ -1800,6 +1800,7 @@ async fn e2e_snapshot_refs_invalidate_iframe_navigation() {
 #[tokio::test]
 #[ignore]
 async fn e2e_screenshot() {
+    let (_env, dir) = binding_test_env();
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -1810,14 +1811,18 @@ async fn e2e_screenshot() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "setcontent", "html": "<h1>Local screenshot fixture</h1><p>Unannotated screenshot pixels and conditional captures.</p>" }),
         &mut state,
     )
     .await;
     assert_success(&resp);
 
     // Default screenshot
-    let resp = execute_command(&json!({ "id": "3", "action": "screenshot" }), &mut state).await;
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "screenshot", "screenshotDir": dir.path() }),
+        &mut state,
+    )
+    .await;
     assert_success(&resp);
     let path = get_data(&resp)["path"].as_str().unwrap();
     assert!(path.ends_with(".png"), "Screenshot path should be .png");
@@ -1833,7 +1838,7 @@ async fn e2e_screenshot() {
         .to_string_lossy()
         .to_string();
     let resp = execute_command(
-        &json!({ "id": "4", "action": "screenshot", "path": tmp_path }),
+        &json!({ "id": "4", "action": "screenshot", "screenshotDir": dir.path(), "path": tmp_path }),
         &mut state,
     )
     .await;
@@ -1842,7 +1847,7 @@ async fn e2e_screenshot() {
     let _ = std::fs::remove_file(&tmp_path);
 
     let resp = execute_command(
-        &json!({ "id": "4a", "action": "screenshot", "ifChanged": true }),
+        &json!({ "id": "4a", "action": "screenshot", "screenshotDir": dir.path(), "ifChanged": true }),
         &mut state,
     )
     .await;
@@ -1852,7 +1857,7 @@ async fn e2e_screenshot() {
     let conditional_path = get_data(&resp)["path"].as_str().unwrap().to_string();
 
     let resp = execute_command(
-        &json!({ "id": "4b", "action": "screenshot", "ifChanged": true }),
+        &json!({ "id": "4b", "action": "screenshot", "screenshotDir": dir.path(), "ifChanged": true }),
         &mut state,
     )
     .await;
@@ -1881,7 +1886,7 @@ async fn e2e_screenshot() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "5a", "action": "screenshot", "ifChanged": true }),
+        &json!({ "id": "5a", "action": "screenshot", "screenshotDir": dir.path(), "ifChanged": true }),
         &mut state,
     )
     .await;
@@ -1892,7 +1897,7 @@ async fn e2e_screenshot() {
     let _ = std::fs::remove_file(get_data(&resp)["path"].as_str().unwrap());
 
     let resp = execute_command(
-        &json!({ "id": "6", "action": "screenshot", "annotate": true }),
+        &json!({ "id": "6", "action": "screenshot", "screenshotDir": dir.path(), "annotate": true }),
         &mut state,
     )
     .await;
@@ -5893,6 +5898,7 @@ async fn e2e_snapshot_cursor_interactive() {
 #[tokio::test]
 #[ignore]
 async fn e2e_screenshot_annotate_many_elements() {
+    let (_env, dir) = binding_test_env();
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -5918,7 +5924,7 @@ async fn e2e_screenshot_annotate_many_elements() {
 
     let start = std::time::Instant::now();
     let resp = execute_command(
-        &json!({ "id": "3", "action": "screenshot", "annotate": true }),
+        &json!({ "id": "3", "action": "screenshot", "screenshotDir": dir.path(), "annotate": true }),
         &mut state,
     )
     .await;
@@ -11711,6 +11717,7 @@ async fn e2e_vitals_reports_metrics() {
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
 
+mod annotations;
 mod geometry;
 
 async fn start_a11y_frame_server() -> (u16, tokio::task::JoinHandle<()>) {

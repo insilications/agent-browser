@@ -111,7 +111,7 @@ The default is the element's own document viewport. The opt-in `top-viewport` mo
 
 Projection requires Chrome/CDP and normal unzoomed viewport geometry. Unsupported iframe mappings (including transformed ancestors with rotation, skew, reflection, perspective, or degenerate sizes), CSS/browser/pinch zoom, displaced visual viewports, missing layout, and unverifiable frame ownership return errors, never frame-local fallback coordinates. A document or renderer change during measurement also fails; retry and refresh refs if the document changed.
 
-Boxes are geometric, not visible or clickable regions: they are not clipped to iframe or viewport boundaries and do not account for occlusion. Offscreen coordinates can be negative. The command does not scroll, focus, dispatch input, change frame selection, or take a snapshot. It performs one measurement attempt without waiting for layout stability. Device-pixel ratio, screenshot scale, and full-page screenshot offsets are separate; do not interpret these CSS coordinates as screenshot pixels. Screenshot, annotation, and input behavior are unchanged.
+Boxes are geometric, not visible or clickable regions: they are not clipped to iframe or viewport boundaries and do not account for occlusion. Offscreen coordinates can be negative. The command does not scroll, focus, dispatch input, change frame selection, or take a snapshot. It performs one measurement attempt without waiting for layout stability. Device-pixel ratio, screenshot scale, and full-page screenshot offsets are separate; do not interpret these CSS coordinates as screenshot pixels. The `get box` option does not change capture routing or input behavior. Chrome annotated screenshots use the same projection with their own capture-relative coordinate conversion and drawing clips.
 
 The MCP tool `agent_browser_get_box` accepts the same optional enum as `relativeTo` and delegates through the CLI parser. Selected-frame `frame_gone` and `frame_not_ready` errors retain their normal JSON and MCP codes.
 
@@ -125,7 +125,7 @@ agent-browser is checked @e1      # Check if checked
 
 ## Screenshots and PDF
 
-Plain screenshots remain page-wide regardless of frame selection. Conditional selector and annotation baselines include their document and renderer identities; ref selectors use their recorded document. Unknown document identity breaks comparison continuity. Existing iframe crop and annotation geometry limitations are unchanged; frame-safe baselines do not imply iframe-only capture.
+Plain screenshots remain page-wide regardless of frame selection. Conditional selector and annotation baselines include their document and renderer identities; ref selectors use their recorded document. Chrome annotations compare the completed annotated image, retaining the same baseline when boxes move or documents scroll. Unchanged results include annotation metadata but no file, path, or image content. Failed projection, capture, or cleanup does not advance history. Unannotated iframe crops retain their existing geometry limitations.
 
 ```bash
 agent-browser screenshot          # Save to temporary directory
@@ -139,6 +139,28 @@ agent-browser pdf output.pdf      # Save as PDF
 `--threshold <0-1>` implies `--if-changed`. Conditional history is isolated by tab and capture scope. JSON responses include `changed`, `revision`, `pixelChangeRatio`, and `threshold`; `path` is present only when the change exceeds the threshold. The first capture for a scope is always changed.
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
+
+### Annotated capture coordinates
+
+```bash
+agent-browser screenshot @e1 --annotate ./element.png
+agent-browser screenshot "#button" --annotate --full ./full.png
+agent-browser screenshot --annotate --if-changed --json
+```
+
+Chrome annotated screenshots support nested same-process and out-of-process iframes, scrolling, fractional borders and padding, and positive axis-aligned scaling. Discovery follows the existing interactive snapshot of the selected document, including its limited child-frame expansion from the main document; it is not a recursive all-frame scan. CSS crop selectors use the selected document. Crop refs use their original document even when another document is selected, and are pinned before the screenshot refreshes snapshot refs. A crop never changes the annotation discovery scope or frame selection.
+
+In JSON, each annotation retains `ref`, `number`, `role`, optional `name`, and `box: {x, y, width, height}`. Chrome box values are now fractional CSS numbers, not rounded integers or raster pixels. The box describes the **full projected border bounds relative to the captured image's CSS origin**. Partly clipped boxes can have negative coordinates and keep their full dimensions. Device-pixel ratio changes raster size, not these CSS values. Label numbers continue to match `@eN`; filtering does not renumber them.
+
+Drawing is clipped to the capture area and every ancestor iframe's content boundary. Wholly clipped and confirmed no-layout candidates are omitted. This is rectangular clipping, not occlusion analysis or general CSS overflow/mask visibility testing. Element crops capture the composited top page without scrolling; they cannot reveal clipped iframe content. Crops are intersected with the available top-page content area, and an empty or unmeasurable crop fails instead of falling back to a page screenshot.
+
+Capture precedence is `--full`, then selector/ref crop, then viewport. With both a selector and `--full`, the image is full-page and boxes are full-page-relative; the selector remains an annotation-overlap filter. Viewport boxes are top-viewport-relative; crop boxes are relative to the effective crop origin.
+
+Unsupported iframe transforms (rotation, skew, reflection, perspective), zero-content embeddings, zoom, unsupported overlay root geometry, missing required metrics, and unverifiable ownership fail explicitly, never with frame-local fallback or a partial list after a projection failure. Observed document, renderer, scroll, or mapping changes during capture also fail with a retry explanation. There is one attempt, no automatic layout-stability waiting. Refresh refs after document replacement; selected-frame `frame_gone` and `frame_not_ready` errors retain their normal codes. Files and conditional history are updated only after validation and overlay cleanup succeed.
+
+These projection guarantees apply to Chrome/CDP. Lightpanda retains its legacy annotation path; Safari/WebDriver still rejects annotations. Unannotated screenshots, screenshot diffs, input, and recording geometry are unchanged.
+
+The MCP `agent_browser_screenshot` tool delegates through the CLI parser, preserving fractional boxes, annotation refs, conditional responses, and frame error codes.
 
 ## Video Recording
 

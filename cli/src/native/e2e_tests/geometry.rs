@@ -3,11 +3,14 @@ use super::*;
 use crate::native::element::{main_world_execution_context, FrameContext};
 use std::{future::Future, pin::Pin};
 
-const BUTTON: &str = "#inside-b-button";
-const BUTTON_STYLE: &str = "document.body.style.cssText='margin:0;height:2000px'; document.querySelector('#inside-b-button').style.cssText='position:absolute;left:20px;top:30px;width:80px;height:40px;border:0;padding:0;border-radius:0;background:rgb(231,17,83);color:rgb(231,17,83);box-sizing:border-box'";
+pub(super) const BUTTON: &str = "#inside-b-button";
+pub(super) const BUTTON_STYLE: &str = "document.body.style.cssText='margin:0;height:2000px'; document.querySelector('#inside-b-button').style.cssText='position:absolute;left:20px;top:30px;width:80px;height:40px;border:0;padding:0;border-radius:0;background:rgb(231,17,83);color:rgb(231,17,83);box-sizing:border-box'";
 
 // Box the command pipeline, whose debug future is too large for test stacks.
-fn command(state: &mut DaemonState, value: Value) -> Pin<Box<dyn Future<Output = Value> + '_>> {
+pub(super) fn command(
+    state: &mut DaemonState,
+    value: Value,
+) -> Pin<Box<dyn Future<Output = Value> + '_>> {
     Box::pin(async move {
         let response = Box::pin(execute_command(&value, state)).await;
         assert_success(&response);
@@ -15,7 +18,11 @@ fn command(state: &mut DaemonState, value: Value) -> Pin<Box<dyn Future<Output =
     })
 }
 
-async fn evaluate(state: &DaemonState, frame: Option<&FrameContext>, script: &str) -> Value {
+pub(super) async fn evaluate(
+    state: &DaemonState,
+    frame: Option<&FrameContext>,
+    script: &str,
+) -> Value {
     let browser = state.browser.as_ref().unwrap();
     let context =
         main_world_execution_context(&browser.client, browser.active_session_id().unwrap(), frame)
@@ -37,7 +44,7 @@ async fn evaluate(state: &DaemonState, frame: Option<&FrameContext>, script: &st
     result.result.value.unwrap_or(Value::Null)
 }
 
-async fn scene(state: &mut DaemonState, port: u16, host: &str) -> FrameContext {
+pub(super) async fn scene(state: &mut DaemonState, port: u16, host: &str) -> FrameContext {
     command(
         state,
         json!({"action":"navigate","url":format!("http://{host}:{port}/top")}),
@@ -87,7 +94,7 @@ async fn expect_box(
     response
 }
 
-async fn button_ref(state: &mut DaemonState) -> String {
+pub(super) async fn button_ref(state: &mut DaemonState) -> String {
     let snapshot = command(state, json!({"action":"snapshot","interactive":true})).await;
     snapshot["data"]["refs"]
         .as_object()

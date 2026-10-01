@@ -61,6 +61,22 @@
         "from": "It is not supported on macOS or Windows.",
         "to": "Browser trust is not supported on macOS or Windows, where Chromium already uses the operating system trust store."
       }
+    ],
+    "/snapshots": [
+      {
+        "from": "In native mode, annotated screenshots currently work on the CDP-backed browser path (Chromium/Lightpanda). The Safari/WebDriver backend does not yet support `--annotate`.",
+        "to": "Chrome supports projection-backed annotated captures. Lightpanda retains legacy annotations; Safari/WebDriver does not support `--annotate`."
+      },
+      {
+        "from": "In native mode, annotated screenshots currently work on the CDP-backed browser path (Chromium/Lightpanda). The Safari/WebDriver backend does not yet support --annotate.",
+        "to": "Chrome supports projection-backed annotated captures. Lightpanda retains legacy annotations; Safari/WebDriver does not support --annotate."
+      }
+    ],
+    "/files": [
+      {
+        "from": "agent-browser screenshot --full ./page-full.png",
+        "to": "agent-browser screenshot --full ./page-full.png\nagent-browser screenshot @e1 --annotate ./element.png"
+      }
     ]
   },
   "resources": {
