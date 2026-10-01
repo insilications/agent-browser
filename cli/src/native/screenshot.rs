@@ -8,6 +8,9 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::RefMap;
 
+mod annotated;
+pub(super) use annotated::take_annotated_screenshot;
+
 const ANNOTATION_OVERLAY_ID: &str = "__agent_browser_annotations__";
 
 #[derive(Debug, Clone)]
@@ -27,12 +30,14 @@ struct RawAnnotation {
     rect: Rect,
 }
 
+/// Full border bounds in capture-relative CSS pixels. Chrome preserves
+/// fractions and unclipped dimensions; DPR affects image pixels, not this box.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnnotationBox {
-    pub x: i64,
-    pub y: i64,
-    pub width: i64,
-    pub height: i64,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +99,8 @@ impl Serialize for ScreenshotAnnotation {
     }
 }
 
-/// Captures screenshot bytes and optional annotations without writing a file.
+/// Captures ordinary screenshots or legacy Lightpanda annotations without
+/// writing a file. Chrome annotations use the shared projection/capture plan.
 pub async fn take_screenshot(
     client: &CdpClient,
     session_id: &str,
@@ -526,10 +532,10 @@ fn project_annotations(
                 role: annotation.role.clone(),
                 name: annotation.name.clone(),
                 box_: AnnotationBox {
-                    x: round(rect.x),
-                    y: round(rect.y),
-                    width: round(rect.width),
-                    height: round(rect.height),
+                    x: round(rect.x) as f64,
+                    y: round(rect.y) as f64,
+                    width: round(rect.width) as f64,
+                    height: round(rect.height) as f64,
                 },
             }
         })
@@ -587,6 +593,28 @@ fn get_screenshot_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn annotation_serialization_keeps_fractional_full_boxes_and_optional_names() {
+        let item = super::ScreenshotAnnotation {
+            ref_id: "e7".into(),
+            number: 7,
+            role: "button".into(),
+            name: None,
+            box_: super::AnnotationBox {
+                x: -10.5,
+                y: 0.25,
+                width: 80.5,
+                height: 40.25,
+            },
+        };
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"ref":"e7","number":7,"role":"button",
+            "box":{"x":-10.5,"y":0.25,"width":80.5,"height":40.25}})
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -653,8 +681,8 @@ mod tests {
         };
 
         let projected = project_annotations(&annotations, Some(&target), None);
-        assert_eq!(projected[0].box_.x, 15);
-        assert_eq!(projected[0].box_.y, 20);
+        assert_eq!(projected[0].box_.x, 15.0);
+        assert_eq!(projected[0].box_.y, 20.0);
     }
 
     #[test]
@@ -673,7 +701,7 @@ mod tests {
         }];
 
         let projected = project_annotations(&annotations, None, Some((10.0, 1000.0)));
-        assert_eq!(projected[0].box_.x, 15);
-        assert_eq!(projected[0].box_.y, 1012);
+        assert_eq!(projected[0].box_.x, 15.0);
+        assert_eq!(projected[0].box_.y, 1012.0);
     }
 }

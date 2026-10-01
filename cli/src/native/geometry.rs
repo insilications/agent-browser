@@ -2,32 +2,37 @@
 //!
 //! A CDP quad is renderer-local, not necessarily document-local: same-process
 //! descendants are already incorporated. Only renderer boundaries add a map.
-//! Keep corners until the last step so future observation consumers can reuse
-//! the math without changing input dispatch or screenshot capture semantics.
+//! Keep corners until projection is complete. Capture origins and drawing
+//! clips belong to screenshots, not input dispatch or the get-box contract.
 
 use std::collections::{HashMap, HashSet};
 
+use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::cdp::client::CdpClient;
-use super::element::{parse_ref, resolve_element_object_id, FrameContext, RefMap};
+use super::element::{
+    evaluate_in_context, frame_execution_context, parse_ref, resolve_element_object_id,
+    FrameContext, RefEntry, RefMap,
+};
 use super::frame::{collect_frame_topology, FrameTarget, FrameTopology};
 
 // Tolerate floating-point noise, not visually significant skew or rotation.
-const EPSILON: f64 = 0.0001;
+pub(super) const EPSILON: f64 = 0.0001;
+pub(super) const MEASUREMENT_CONCURRENCY: usize = 16;
 
 fn unavailable(detail: &str) -> String {
     format!("Cannot project bounding box to top-viewport: {detail}")
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Point {
     x: f64,
     y: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Quad([Point; 4]);
 
 impl Quad {
@@ -56,15 +61,52 @@ impl Quad {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct Rect {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+/// Unrounded CSS geometry. Its coordinate space is supplied by the caller;
+/// screenshot capture conversion never changes the full element dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub(super) struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
-#[derive(Debug)]
+impl Rect {
+    pub fn read(value: &Value) -> Result<Self, String> {
+        Ok(Self {
+            x: number(&value["x"])?,
+            y: number(&value["y"])?,
+            width: number(&value["width"])?,
+            height: number(&value["height"])?,
+        })
+    }
+
+    pub fn positive(self) -> bool {
+        self.width > 0.0 && self.height > 0.0
+    }
+
+    pub fn translated(self, x: f64, y: f64) -> Self {
+        Self {
+            x: self.x + x,
+            y: self.y + y,
+            ..self
+        }
+    }
+
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let rect = Self {
+            x,
+            y,
+            width: (self.x + self.width).min(other.x + other.width) - x,
+            height: (self.y + self.height).min(other.y + other.height) - y,
+        };
+        rect.positive().then_some(rect)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct AxisAlignedMap {
     origin: Point,
     sx: f64,
@@ -232,7 +274,7 @@ const METRICS_JS: &str = r#"function(embedding) {
         }
     }
     if (!embedding) {
-        return {};
+        return { noLayout: this.getClientRects().length === 0 };
     }
     const s = win.getComputedStyle(this);
     const px = (value) => (/^-?(?:\d+(?:\.\d*)?|\.\d+)px$/.test(value) ? parseFloat(value) : NaN);
@@ -261,6 +303,15 @@ async fn element_metrics(
         )
         .await?;
     if result.get("exceptionDetails").is_some() {
+        release_exception_objects(
+            client,
+            session,
+            result.pointer("/result/objectId").and_then(Value::as_str),
+            result
+                .pointer("/exceptionDetails/exception/objectId")
+                .and_then(Value::as_str),
+        )
+        .await;
         return Err(unavailable("could not inspect element layout metrics"));
     }
     let value = result
@@ -271,6 +322,28 @@ async fn element_metrics(
         return Err(unavailable(message));
     }
     Ok(value.clone())
+}
+
+/// A thrown Runtime exception can retain an object even with returnByValue.
+/// Release both protocol locations without double-releasing the same handle.
+pub(super) async fn release_exception_objects(
+    client: &CdpClient,
+    session: &str,
+    result: Option<&str>,
+    exception: Option<&str>,
+) {
+    let mut seen = HashSet::new();
+    for object in [result, exception].into_iter().flatten() {
+        if seen.insert(object) {
+            let _ = client
+                .send_command(
+                    "Runtime.releaseObject",
+                    Some(json!({"objectId":object})),
+                    Some(session),
+                )
+                .await;
+        }
+    }
 }
 
 async fn box_model(client: &CdpClient, session: &str, object: &str) -> Result<Value, String> {
@@ -287,53 +360,336 @@ async fn box_model(client: &CdpClient, session: &str, object: &str) -> Result<Va
         .ok_or_else(|| unavailable("element has no measurable box model"))
 }
 
-/// A single measurement after selected-frame preparation. No action replay,
-/// geometry cache, scrolling, or transfer of handles to replacement renderers.
-pub(super) async fn top_viewport_box(
-    client: &CdpClient,
-    page_session: &str,
-    refs: &RefMap,
-    selector: &str,
-    selected: Option<&FrameContext>,
-    iframe_sessions: &HashMap<String, String>,
-) -> Result<Value, String> {
-    let topology = collect_frame_topology(client, page_session, iframe_sessions).await?;
-    let frame_id = if let Some(id) = parse_ref(selector) {
-        refs.get(&id)
-            .ok_or_else(|| format!("Unknown ref: {id}"))?
-            .frame_id
-            .as_deref()
-    } else {
-        selected.map(|frame| frame.frame_id.as_str())
+/// Acquisition errors are never confused with a confirmed non-rendering node.
+/// Existing public commands retain their normal string error envelope.
+#[derive(Debug)]
+pub(super) enum ProjectionError {
+    Unavailable(String),
+    Changed(String),
+}
+
+impl From<String> for ProjectionError {
+    fn from(message: String) -> Self {
+        Self::Unavailable(message)
     }
-    .unwrap_or(&topology.top_frame_id);
-    let chain = frame_chain(&topology, frame_id)?;
-    let (object, session) =
-        resolve_element_object_id(client, page_session, refs, selector, iframe_sessions).await?;
-    let mut handles = vec![(session.clone(), object.clone())];
-    // Keep cleanup outside the fallible measurement so both successful and
-    // rejected projections release every temporary owner/element handle.
-    let result = async {
-        if session != chain[0].session_id {
-            return Err(unavailable(
-                "element renderer changed; take a fresh snapshot and retry",
+}
+
+impl std::fmt::Display for ProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) => f.write_str(message),
+            Self::Changed(detail) => f.write_str(&unavailable(&format!(
+                "{detail} changed during measurement; retry the command"
+            ))),
+        }
+    }
+}
+
+type ProjectionResult<T> = Result<T, ProjectionError>;
+
+#[derive(Debug, Clone)]
+struct RemoteHandle {
+    session: String,
+    object: String,
+}
+
+/// A selector target pinned before an annotation snapshot refreshes the refs.
+/// Handles never migrate to a replacement document or renderer.
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedTarget {
+    pub frame_id: String,
+    handle: RemoteHandle,
+}
+
+#[derive(Debug)]
+pub(super) struct ProjectedGeometry {
+    border: Quad,
+    /// Top-viewport content boundaries, including same-process embeddings.
+    pub embedding_clips: Vec<Rect>,
+}
+
+impl ProjectedGeometry {
+    pub fn bounds(&self) -> Rect {
+        self.border.bounds()
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum Measurement {
+    Box(ProjectedGeometry),
+    NoLayout,
+}
+
+pub(super) struct ProjectedRef {
+    pub ref_id: String,
+    pub entry: RefEntry,
+    pub geometry: ProjectedGeometry,
+}
+
+struct Embedding {
+    handle: RemoteHandle,
+    dimensions: Value,
+    model: Value,
+    mapping: AxisAlignedMap,
+    content: Quad,
+}
+
+struct DocumentProbe {
+    handle: RemoteHandle,
+    metrics: Value,
+}
+
+// These are document-local observations, not scale denominators. In particular,
+// innerWidth is never used to reconstruct an iframe's fractional sizing box.
+const DOCUMENT_METRICS_JS: &str = r#"function() {
+    if (!this.isConnected || !this.ownerDocument.defaultView) return null;
+    const w = this.ownerDocument.defaultView;
+    return {x:w.scrollX, y:w.scrollY, width:w.innerWidth, height:w.innerHeight};
+}"#;
+
+async fn document_metrics(client: &CdpClient, handle: &RemoteHandle) -> ProjectionResult<Value> {
+    let result = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(json!({
+                "objectId":handle.object, "functionDeclaration":DOCUMENT_METRICS_JS,
+                "returnByValue":true,
+            })),
+            Some(&handle.session),
+        )
+        .await?;
+    if result.get("exceptionDetails").is_some() {
+        release_exception_objects(
+            client,
+            &handle.session,
+            result.pointer("/result/objectId").and_then(Value::as_str),
+            result
+                .pointer("/exceptionDetails/exception/objectId")
+                .and_then(Value::as_str),
+        )
+        .await;
+        return Err(unavailable("could not inspect document scrolling").into());
+    }
+    let value = result
+        .pointer("/result/value")
+        .ok_or_else(|| unavailable("document metrics unavailable"))?;
+    for key in ["x", "y", "width", "height"] {
+        number(&value[key])?;
+    }
+    Ok(value.clone())
+}
+
+/// Compare browser-produced geometry with numerical tolerance. This is a final
+/// validation pass, not stability polling or an atomic layout snapshot.
+fn metrics_match(before: &Value, after: &Value) -> bool {
+    match (before, after) {
+        (Value::Number(a), Value::Number(b)) => a
+            .as_f64()
+            .zip(b.as_f64())
+            .is_some_and(|(a, b)| a.is_finite() && b.is_finite() && (a - b).abs() <= EPSILON),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| metrics_match(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, a)| b.get(key).is_some_and(|b| metrics_match(a, b)))
+        }
+        _ => before == after,
+    }
+}
+
+/// One operation's shared acquisition state. Nothing survives the command.
+/// Both get-box and annotations use the same quads and sizing-box calculation;
+/// annotations additionally validate scrolling/embedding geometry across capture.
+pub(super) struct ProjectionPass<'a> {
+    client: &'a CdpClient,
+    page_session: &'a str,
+    iframe_sessions: &'a HashMap<String, String>,
+    topology: FrameTopology,
+    chains: HashMap<String, Vec<FrameTarget>>,
+    viewports: HashMap<String, Value>,
+    embeddings: HashMap<String, Embedding>,
+    documents: HashMap<String, DocumentProbe>,
+    handles: Vec<RemoteHandle>,
+}
+
+impl<'a> ProjectionPass<'a> {
+    pub async fn new(
+        client: &'a CdpClient,
+        page_session: &'a str,
+        iframe_sessions: &'a HashMap<String, String>,
+    ) -> ProjectionResult<Self> {
+        let topology = collect_frame_topology(client, page_session, iframe_sessions).await?;
+        Ok(Self {
+            client,
+            page_session,
+            iframe_sessions,
+            topology,
+            chains: HashMap::new(),
+            viewports: HashMap::new(),
+            embeddings: HashMap::new(),
+            documents: HashMap::new(),
+            handles: Vec::new(),
+        })
+    }
+
+    pub fn include_frame(&mut self, frame: Option<&str>) -> ProjectionResult<String> {
+        let id = frame.unwrap_or(&self.topology.top_frame_id).to_string();
+        if !self.chains.contains_key(&id) {
+            self.chains
+                .insert(id.clone(), frame_chain(&self.topology, &id)?);
+        }
+        Ok(id)
+    }
+
+    pub async fn pin_selector(
+        &mut self,
+        refs: &RefMap,
+        selector: &str,
+        selected: Option<&FrameContext>,
+    ) -> ProjectionResult<ResolvedTarget> {
+        let frame = if let Some(id) = parse_ref(selector) {
+            refs.get(&id)
+                .ok_or_else(|| format!("Unknown ref: {id}"))?
+                .frame_id
+                .as_deref()
+        } else {
+            selected.map(|frame| frame.frame_id.as_str())
+        };
+        let frame_id = self.include_frame(frame)?;
+        let (object, session) = resolve_element_object_id(
+            self.client,
+            self.page_session,
+            refs,
+            selector,
+            self.iframe_sessions,
+        )
+        .await?;
+        let handle = RemoteHandle { object, session };
+        self.handles.push(handle.clone());
+        if handle.session != self.chains[&frame_id][0].session_id {
+            return Err(ProjectionError::Changed(
+                "frame document or renderer".into(),
             ));
         }
-        let mut sessions = HashSet::new();
-        for frame in &chain {
-            if sessions.insert(&frame.session_id) {
-                viewport_supported(
-                    &client
-                        .send_command_no_params("Page.getLayoutMetrics", Some(&frame.session_id))
-                        .await?,
-                )?;
+        Ok(ResolvedTarget { frame_id, handle })
+    }
+
+    /// Register every acquired handle, including successes after a failed
+    /// concurrent resolve, before propagating an error to the cleanup boundary.
+    pub async fn resolve_refs(
+        &mut self,
+        refs: &RefMap,
+    ) -> ProjectionResult<Vec<(String, RefEntry, ResolvedTarget)>> {
+        let mut inputs = Vec::new();
+        for (id, entry) in refs.entries_sorted() {
+            let Some(backend) = entry.backend_node_id else {
+                continue;
+            };
+            let frame_id = self.include_frame(entry.frame_id.as_deref())?;
+            let session = entry
+                .session_id
+                .clone()
+                .unwrap_or_else(|| self.chains[&frame_id][0].session_id.clone());
+            if session != self.chains[&frame_id][0].session_id {
+                return Err(ProjectionError::Changed(
+                    "frame document or renderer".into(),
+                ));
+            }
+            inputs.push((id, entry, frame_id, session, backend));
+        }
+        let client = self.client;
+        let mut results = Vec::new();
+        for chunk in inputs.chunks(MEASUREMENT_CONCURRENCY) {
+            results.extend(
+                join_all(
+                    chunk
+                        .iter()
+                        .map(|(id, entry, frame_id, session, backend)| async move {
+                            let value = client
+                                .send_command(
+                                    "DOM.resolveNode",
+                                    Some(json!({"backendNodeId":backend})),
+                                    Some(session),
+                                )
+                                .await?;
+                            let object = value
+                                .pointer("/object/objectId")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    unavailable("annotation target has no remote handle")
+                                })?
+                                .to_string();
+                            Ok::<_, String>((
+                                id.clone(),
+                                entry.clone(),
+                                ResolvedTarget {
+                                    frame_id: frame_id.clone(),
+                                    handle: RemoteHandle {
+                                        session: session.clone(),
+                                        object,
+                                    },
+                                },
+                            ))
+                        }),
+                )
+                .await,
+            );
+        }
+        let mut targets = Vec::new();
+        let mut error = None;
+        for result in results {
+            match result {
+                Ok((id, entry, target)) => {
+                    self.handles.push(target.handle.clone());
+                    targets.push((id, entry, target));
+                }
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
             }
         }
-        element_metrics(client, &session, &object, false).await?;
-        let mut quad = Quad::read(&box_model(client, &session, &object).await?["border"])?;
-        for pair in chain.windows(2) {
-            let (child, parent) = (&pair[0], &pair[1]);
-            let owner = client
+        if let Some(error) = error {
+            return Err(error.into());
+        }
+        Ok(targets)
+    }
+
+    pub async fn prepare(&mut self, capture: bool) -> ProjectionResult<()> {
+        let mut frames = HashMap::new();
+        for chain in self.chains.values() {
+            for frame in chain {
+                frames.insert(frame.frame_id.clone(), frame.clone());
+            }
+        }
+        let mut sessions: Vec<_> = frames.values().map(|f| f.session_id.clone()).collect();
+        sessions.sort();
+        sessions.dedup();
+        for session in sessions {
+            let metrics = self
+                .client
+                .send_command_no_params("Page.getLayoutMetrics", Some(&session))
+                .await?;
+            viewport_supported(&metrics)?;
+            self.viewports.insert(session, metrics);
+        }
+        let mut ordered: Vec<_> = frames.values().cloned().collect();
+        ordered.sort_by(|a, b| a.frame_id.cmp(&b.frame_id));
+        for child in &ordered {
+            if child.frame_id == self.topology.top_frame_id {
+                continue;
+            }
+            let parent = frames
+                .get(
+                    child
+                        .parent_id
+                        .as_deref()
+                        .ok_or_else(|| unavailable("missing parent frame"))?,
+                )
+                .ok_or_else(|| unavailable("missing parent renderer"))?;
+            let owner = self
+                .client
                 .send_command(
                     "DOM.getFrameOwner",
                     Some(json!({"frameId":child.frame_id})),
@@ -343,50 +699,296 @@ pub(super) async fn top_viewport_box(
             let backend = owner["backendNodeId"]
                 .as_i64()
                 .ok_or_else(|| unavailable("iframe owner is unavailable"))?;
-            let resolved = client
+            let resolved = self
+                .client
                 .send_command(
                     "DOM.resolveNode",
                     Some(json!({"backendNodeId":backend})),
                     Some(&parent.session_id),
                 )
                 .await?;
-            let owner_object = resolved
+            let object = resolved
                 .pointer("/object/objectId")
                 .and_then(Value::as_str)
                 .ok_or_else(|| unavailable("iframe owner has no remote handle"))?
                 .to_string();
-            handles.push((parent.session_id.clone(), owner_object.clone()));
+            let handle = RemoteHandle {
+                object,
+                session: parent.session_id.clone(),
+            };
+            self.handles.push(handle.clone());
             let dimensions =
-                element_metrics(client, &parent.session_id, &owner_object, true).await?;
-            let mapping = AxisAlignedMap::from_box_model(
-                &box_model(client, &parent.session_id, &owner_object).await?,
-                &dimensions,
-            )?;
-            if child.session_id != parent.session_id {
-                quad = mapping.apply(quad)?;
+                element_metrics(self.client, &handle.session, &handle.object, true).await?;
+            let model = box_model(self.client, &handle.session, &handle.object).await?;
+            let mapping = AxisAlignedMap::from_box_model(&model, &dimensions)?;
+            let content = Quad::read(&model["content"])?;
+            self.embeddings.insert(
+                child.frame_id.clone(),
+                Embedding {
+                    handle,
+                    dimensions,
+                    model,
+                    mapping,
+                    content,
+                },
+            );
+        }
+        if capture {
+            for frame in ordered {
+                let context_frame = FrameContext {
+                    frame_id: frame.frame_id.clone(),
+                    session_id: frame.session_id.clone(),
+                };
+                let context = frame_execution_context(
+                    self.client,
+                    self.page_session,
+                    (frame.frame_id != self.topology.top_frame_id).then_some(&context_frame),
+                )
+                .await?;
+                let value = evaluate_in_context(
+                    self.client,
+                    &context,
+                    "document.documentElement",
+                    false,
+                    false,
+                )
+                .await?;
+                if let Some(exception) = &value.exception_details {
+                    release_exception_objects(
+                        self.client,
+                        &frame.session_id,
+                        value.result.object_id.as_deref(),
+                        exception
+                            .exception
+                            .as_ref()
+                            .and_then(|e| e.object_id.as_deref()),
+                    )
+                    .await;
+                    return Err(unavailable("document root could not be resolved").into());
+                }
+                let object = value
+                    .result
+                    .object_id
+                    .ok_or_else(|| unavailable("document root is unavailable"))?;
+                let handle = RemoteHandle {
+                    object,
+                    session: frame.session_id.clone(),
+                };
+                self.handles.push(handle.clone());
+                let metrics = document_metrics(self.client, &handle).await?;
+                self.documents
+                    .insert(frame.frame_id, DocumentProbe { handle, metrics });
             }
         }
-        let current = collect_frame_topology(client, page_session, iframe_sessions).await?;
-        if current.top_frame_id != topology.top_frame_id
-            || frame_chain(&current, frame_id)? != chain
-        {
-            return Err(unavailable(
-                "frame document or renderer changed during measurement; retry the command",
+        Ok(())
+    }
+
+    fn project(&self, mut quad: Quad, chain: &[FrameTarget]) -> ProjectionResult<Quad> {
+        for pair in chain.windows(2) {
+            if pair[0].session_id != pair[1].session_id {
+                quad = self.embeddings[&pair[0].frame_id].mapping.apply(quad)?;
+            }
+        }
+        Ok(quad)
+    }
+
+    pub async fn measure(
+        &self,
+        target: &ResolvedTarget,
+        omit_no_layout: bool,
+    ) -> ProjectionResult<Measurement> {
+        let metrics = element_metrics(
+            self.client,
+            &target.handle.session,
+            &target.handle.object,
+            false,
+        )
+        .await?;
+        if omit_no_layout && metrics["noLayout"] == true {
+            return Ok(Measurement::NoLayout);
+        }
+        let model = box_model(self.client, &target.handle.session, &target.handle.object).await?;
+        let chain = &self.chains[&target.frame_id];
+        let border = self.project(Quad::read(&model["border"])?, chain)?;
+        if omit_no_layout && !border.bounds().positive() {
+            return Ok(Measurement::NoLayout);
+        }
+        let mut embedding_clips = Vec::new();
+        for (i, pair) in chain.windows(2).enumerate() {
+            let owner = &self.embeddings[&pair[0].frame_id];
+            embedding_clips.push(self.project(owner.content, &chain[i + 1..])?.bounds());
+        }
+        Ok(Measurement::Box(ProjectedGeometry {
+            border,
+            embedding_clips,
+        }))
+    }
+
+    pub async fn measure_refs(
+        &self,
+        targets: &[(String, RefEntry, ResolvedTarget)],
+    ) -> ProjectionResult<Vec<ProjectedRef>> {
+        let mut results = Vec::new();
+        for chunk in targets.chunks(MEASUREMENT_CONCURRENCY) {
+            results.extend(
+                join_all(chunk.iter().map(|(id, entry, target)| async move {
+                    Ok::<_, ProjectionError>(match self.measure(target, true).await? {
+                        Measurement::Box(geometry) => Some(ProjectedRef {
+                            ref_id: id.clone(),
+                            entry: entry.clone(),
+                            geometry,
+                        }),
+                        Measurement::NoLayout => None,
+                    })
+                }))
+                .await,
+            );
+        }
+        Ok(results
+            .into_iter()
+            .collect::<ProjectionResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    pub fn page_metrics(&self) -> &Value {
+        &self.viewports[self.page_session]
+    }
+    pub fn page_scroll(&self) -> &Value {
+        &self.documents[&self.topology.top_frame_id].metrics
+    }
+    pub fn page_frame(&self) -> FrameContext {
+        FrameContext {
+            frame_id: self.topology.top_frame_id.clone(),
+            session_id: self.page_session.to_string(),
+        }
+    }
+
+    pub fn document_identity(&self, frame_id: &str) -> Value {
+        let frame = &self.topology.frames[frame_id];
+        json!({"frame":frame.frame_id,"loader":frame.loader_id,"session":frame.session_id})
+    }
+
+    /// Stable identity only: moving boxes and scroll offsets must not create new
+    /// conditional screenshot scopes and bypass normal pixel comparison.
+    pub fn document_signature(&self) -> Value {
+        let mut frames: Vec<_> = self.chains.values().flatten().collect();
+        frames.sort_by(|a, b| a.frame_id.cmp(&b.frame_id));
+        frames.dedup_by(|a, b| a.frame_id == b.frame_id);
+        json!(frames
+            .into_iter()
+            .map(|f| self.document_identity(&f.frame_id))
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn validate(&self, capture: bool) -> ProjectionResult<()> {
+        let current =
+            collect_frame_topology(self.client, self.page_session, self.iframe_sessions).await?;
+        if current.top_frame_id != self.topology.top_frame_id {
+            return Err(ProjectionError::Changed(
+                "frame document or renderer".into(),
             ));
         }
-        serde_json::to_value(quad.bounds()).map_err(|e| unavailable(&e.to_string()))
+        for (id, chain) in &self.chains {
+            if frame_chain(&current, id)? != *chain {
+                return Err(ProjectionError::Changed(
+                    "frame document or renderer".into(),
+                ));
+            }
+        }
+        if capture {
+            for (session, before) in &self.viewports {
+                let after = self
+                    .client
+                    .send_command_no_params("Page.getLayoutMetrics", Some(session))
+                    .await?;
+                viewport_supported(&after)?;
+                // OOPIF visual-viewport dimensions mirror the top page and can
+                // lag its emulation resize. They are not the child viewport.
+                // Validate scale/origin there, but use each document's own
+                // scroll/size probe and its owner's quad for child stability.
+                if session == self.page_session {
+                    for key in ["cssVisualViewport", "cssLayoutViewport", "cssContentSize"] {
+                        if !metrics_match(&before[key], &after[key]) {
+                            return Err(ProjectionError::Changed(format!("top-page {key}")));
+                        }
+                    }
+                }
+            }
+            for document in self.documents.values() {
+                if !metrics_match(
+                    &document.metrics,
+                    &document_metrics(self.client, &document.handle).await?,
+                ) {
+                    return Err(ProjectionError::Changed(
+                        "document scrolling or viewport size".into(),
+                    ));
+                }
+            }
+            for embedding in self.embeddings.values() {
+                let handle = &embedding.handle;
+                let dimensions =
+                    element_metrics(self.client, &handle.session, &handle.object, true).await?;
+                let model = box_model(self.client, &handle.session, &handle.object).await?;
+                AxisAlignedMap::from_box_model(&model, &dimensions)?;
+                if !metrics_match(&dimensions, &embedding.dimensions)
+                    || !metrics_match(&model["content"], &embedding.model["content"])
+                    || (dimensions["boxSizing"] == "border-box"
+                        && !metrics_match(&model["border"], &embedding.model["border"]))
+                {
+                    return Err(ProjectionError::Changed(
+                        "iframe sizing or content mapping".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn release(&mut self) {
+        let client = self.client;
+        let handles = std::mem::take(&mut self.handles);
+        for chunk in handles.chunks(MEASUREMENT_CONCURRENCY) {
+            join_all(chunk.iter().map(|handle| async move {
+                let _ = client
+                    .send_command(
+                        "Runtime.releaseObject",
+                        Some(json!({"objectId":handle.object})),
+                        Some(&handle.session),
+                    )
+                    .await;
+            }))
+            .await;
+        }
+    }
+}
+
+/// Single-target adapter. Preserve get-box's unclipped border bounds, normal
+/// errors, and one read-only attempt without adopting annotation/capture policy.
+pub(super) async fn top_viewport_box(
+    client: &CdpClient,
+    page_session: &str,
+    refs: &RefMap,
+    selector: &str,
+    selected: Option<&FrameContext>,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<Value, String> {
+    let mut pass = ProjectionPass::new(client, page_session, iframe_sessions)
+        .await
+        .map_err(|e| e.to_string())?;
+    let result: ProjectionResult<Value> = async {
+        let target = pass.pin_selector(refs, selector, selected).await?;
+        pass.prepare(false).await?;
+        let Measurement::Box(geometry) = pass.measure(&target, false).await? else {
+            unreachable!()
+        };
+        pass.validate(false).await?;
+        serde_json::to_value(geometry.bounds()).map_err(|e| unavailable(&e.to_string()).into())
     }
     .await;
-    for (sid, handle) in handles {
-        let _ = client
-            .send_command(
-                "Runtime.releaseObject",
-                Some(json!({"objectId":handle})),
-                Some(&sid),
-            )
-            .await;
-    }
-    result
+    pass.release().await;
+    result.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -680,3 +1282,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod batch_tests;

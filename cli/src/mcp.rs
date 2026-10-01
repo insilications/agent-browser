@@ -933,13 +933,13 @@ fn tools() -> Vec<Value> {
             "Capture a screenshot and return the saved path. Small PNG/JPEG screenshots are also returned as image content.",
             json!({
                 "path": { "type": "string", "description": "Optional output path." },
-                "selector": { "type": "string", "description": "Optional @ref or CSS selector to capture." },
+                "selector": { "type": "string", "description": "Optional @ref or CSS selector. Chrome annotated crops retain ref provenance across snapshot refresh; CSS uses the selected document. fullPage takes precedence, retaining selector-overlap filtering." },
                 "fullPage": { "type": "boolean", "default": false },
-                "annotate": { "type": "boolean", "default": false, "description": "Number visible elements in the screenshot." },
+                "annotate": { "type": "boolean", "default": false, "description": "Number candidates from the selected document’s interactive snapshot, not a recursive frame scan. Chrome projects nested iframe geometry and returns fractional full border boxes in capture-relative CSS pixels, independent of DPR. Drawing is clipped to capture/iframe bounds, not general occlusion. Unsupported projection or changes during capture fail explicitly. Lightpanda keeps legacy behavior; WebDriver is unsupported." },
                 "format": { "type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format." },
                 "quality": { "type": "integer", "minimum": 0, "maximum": 100, "description": "JPEG quality." },
                 "screenshotDir": { "type": "string", "description": "Default output directory when path is omitted." },
-                "ifChanged": { "type": "boolean", "default": false, "description": "Return image content only when pixels changed. Plain captures remain page-wide; selector/annotation baselines include document and renderer identity, using ref provenance where applicable. Existing iframe crop/annotation geometry limitations remain." },
+                "ifChanged": { "type": "boolean", "default": false, "description": "Return image content only when pixels changed, including annotation pixels. Baselines include document/renderer identity, not coordinates or scroll. Unchanged captures retain annotation metadata without image content; failed capture/validation/cleanup does not advance history. Unannotated iframe crops retain existing geometry limitations." },
                 "threshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Maximum changed-pixel ratio to treat as unchanged. Implies ifChanged." }
             }),
             &[],
@@ -4228,15 +4228,22 @@ mod tests {
             json!({"selector": "#a"}),
             json!({"selector": "#b"}),
             json!({"fullPage": true}),
+            json!({"selector": "@e7", "fullPage": true, "annotate": true}),
+            json!({"selector": "e7", "annotate": true}),
         ] {
             let mut arguments = scope.clone();
             arguments["ifChanged"] = json!(true);
             let args = screenshot_command_args(&arguments).unwrap();
             let flags = crate::flags::parse_flags(&args);
-            let command = crate::commands::parse_command(&args, &flags).unwrap();
+            let command =
+                crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
             assert_eq!(command["action"], "screenshot");
             assert_eq!(command["ifChanged"], true);
             assert_eq!(command["selector"], scope["selector"]);
+            assert_eq!(
+                command["annotate"].as_bool().unwrap_or(false),
+                scope["annotate"].as_bool().unwrap_or(false)
+            );
             assert_eq!(
                 command["fullPage"].as_bool().unwrap_or(false),
                 scope["fullPage"].as_bool().unwrap_or(false)
@@ -5365,6 +5372,45 @@ mod observation_response_tests {
             .unwrap()
             .iter()
             .all(|item| item["type"] != "image"));
+    }
+
+    #[test]
+    fn annotated_screenshot_metadata_and_failures_preserve_cli_contract() {
+        let annotations = json!([{"ref":"e7","number":7,"role":"button","name":"Save",
+            "box":{"x":-10.5,"y":0.25,"width":80.5,"height":40.25}},
+            {"ref":"e9","number":9,"role":"button","box":{"x":10.25,"y":0.,"width":20.,"height":10.}}]);
+        let response = json!({"success":true,"data":{"changed":false,"revision":2,
+            "annotations":annotations,"lifecycle":{"reused":true}}});
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(0),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(result["isError"], false);
+        assert!(result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "image"));
+        for code in [None, Some("frame_gone"), Some("frame_not_ready")] {
+            let mut response = json!({"success":false,"error":"Cannot capture annotated screenshot: geometry changed; retry the command"});
+            if let Some(code) = code {
+                response["code"] = json!(code);
+            }
+            let result = tool_result_from_run(CliRun {
+                exit_code: Some(1),
+                stdout: response.to_string(),
+                stderr: String::new(),
+            });
+            assert_eq!(result["structuredContent"]["response"], response);
+            assert_eq!(result["isError"], true);
+            assert!(result["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "image"));
+        }
     }
 
     #[test]

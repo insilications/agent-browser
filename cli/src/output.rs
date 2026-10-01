@@ -2180,7 +2180,9 @@ Options:
                        Each label [N] corresponds to ref @eN from snapshot.
                        Prints a legend mapping labels to element roles/names.
                        With --json, annotations are included in the response.
-                       Supported on Chromium and Lightpanda.
+                       Chrome: fractional full border boxes in capture-relative CSS
+                       pixels, independent of DPR. Clipping affects drawing only.
+                       Lightpanda retains legacy annotations; no WebDriver support.
   --screenshot-dir <path>  Default output directory for screenshots
                        (or AGENT_BROWSER_SCREENSHOT_DIR env)
   --screenshot-quality <0-100>  JPEG quality (0-100, only applies to jpeg format)
@@ -2194,7 +2196,16 @@ Global Options:
 
 Plain screenshots remain page-wide. Conditional selector/annotation history
 is document- and renderer-scoped; ref selectors use snapshot provenance.
-Existing iframe crop/annotation geometry limitations remain unchanged.
+Chrome annotations follow the selected document's interactive snapshot scope,
+not a recursive all-frame scan. CSS crop selectors use that document; refs keep
+their original provenance. Nested iframe geometry is projected into the top page.
+Drawing is clipped to capture/iframe bounds, not tested for general occlusion.
+--full wins over a selector crop; the selector still filters annotation overlap.
+Crops capture the composited top page without scrolling and intersect its content
+area. Unsupported mappings, empty crops, or changed document/scroll/geometry fail
+explicitly. No automatic stability waiting; refresh refs after document replacement.
+Files/history update only after validation and cleanup. Unannotated iframe crops
+retain existing limitations.
 
 Examples:
   agent-browser screenshot
@@ -2204,7 +2215,9 @@ Examples:
   agent-browser screenshot --if-changed --threshold 0.01
   agent-browser screenshot --annotate              # Labeled screenshot + legend
   agent-browser screenshot --annotate ./page.png   # Save annotated screenshot
-  agent-browser screenshot --annotate --json       # JSON output with annotations
+  agent-browser screenshot --annotate --json       # Fractional CSS annotation boxes
+  agent-browser screenshot @e1 --annotate ./crop.png
+  agent-browser screenshot "#button" --annotate --full ./full.png
   agent-browser screenshot --screenshot-dir ./shots # Save to custom directory
   agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
 "##
@@ -4067,7 +4080,7 @@ Options:
   -p, --provider <name>      Browser provider: ios, browserbase, kernel, browseruse, browserless, agentcore, or plugin name
   --device <name>            iOS device name (e.g., "iPhone 15 Pro")
   --json                     JSON output
-  --annotate                 Annotated screenshot with numbered labels and legend
+  --annotate                 Numbered labels; Chrome boxes use capture-relative CSS pixels
   --relative-to <space>      get box only: frame-viewport (default) or top-viewport (Chrome/CDP)
   --screenshot-dir <path>    Default screenshot output directory (or AGENT_BROWSER_SCREENSHOT_DIR)
   --screenshot-quality <n>   JPEG quality 0-100; ignored for PNG (or AGENT_BROWSER_SCREENSHOT_QUALITY)

@@ -6304,7 +6304,8 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
     } else {
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
         let session_id = mgr.active_session_id()?.to_string();
-        if if_changed {
+        let projected_annotations = annotate && state.engine == "chrome";
+        if if_changed && !projected_annotations {
             match screenshot_document_scope(
                 mgr,
                 state.active_frame.as_ref(),
@@ -6323,37 +6324,54 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
                 None => comparable = false,
             }
         }
-        if annotate {
-            state.ref_map.begin_snapshot();
-            let _ = snapshot::take_snapshot(
+        let result = if projected_annotations {
+            let capture = screenshot::take_annotated_screenshot(
                 &mgr.client,
                 &session_id,
-                &SnapshotOptions {
-                    interactive: true,
-                    ..SnapshotOptions::default()
-                },
                 &mut state.ref_map,
-                state
-                    .active_frame
-                    .as_ref()
-                    .map(|frame| frame.frame_id.as_str()),
-                state
-                    .active_frame
-                    .as_ref()
-                    .map(|frame| frame.session_id.as_str()),
+                &options,
+                state.active_frame.as_ref(),
                 &state.iframe_sessions,
             )
             .await?;
-        }
+            if if_changed {
+                signature.push_str(";documents=");
+                signature.push_str(&capture.document_signature.to_string());
+            }
+            capture.result
+        } else {
+            if annotate {
+                state.ref_map.begin_snapshot();
+                let _ = snapshot::take_snapshot(
+                    &mgr.client,
+                    &session_id,
+                    &SnapshotOptions {
+                        interactive: true,
+                        ..SnapshotOptions::default()
+                    },
+                    &mut state.ref_map,
+                    state
+                        .active_frame
+                        .as_ref()
+                        .map(|frame| frame.frame_id.as_str()),
+                    state
+                        .active_frame
+                        .as_ref()
+                        .map(|frame| frame.session_id.as_str()),
+                    &state.iframe_sessions,
+                )
+                .await?;
+            }
 
-        let result = screenshot::take_screenshot(
-            &mgr.client,
-            &session_id,
-            &state.ref_map,
-            &options,
-            &state.iframe_sessions,
-        )
-        .await?;
+            screenshot::take_screenshot(
+                &mgr.client,
+                &session_id,
+                &state.ref_map,
+                &options,
+                &state.iframe_sessions,
+            )
+            .await?
+        };
 
         (session_id, result)
     };
@@ -18838,6 +18856,7 @@ mod frame_observation_tests {
         for command in [
             json!({"action":"snapshot", "delta":true}),
             json!({"action":"screenshot", "ifChanged":true, "selector":"button"}),
+            json!({"action":"screenshot", "annotate":true, "ifChanged":true, "selector":"button"}),
         ] {
             let response = execute_command(&command, &mut state).await;
             assert_eq!(response["code"], "frame_gone");
@@ -18848,6 +18867,7 @@ mod frame_observation_tests {
         for command in [
             json!({"action":"snapshot", "delta":true, "timeout":0}),
             json!({"action":"screenshot", "ifChanged":true, "selector":"button", "timeout":0}),
+            json!({"action":"screenshot", "annotate":true, "ifChanged":true, "selector":"button", "timeout":0}),
         ] {
             let response = execute_command(&command, &mut state).await;
             assert_eq!(response["code"], "frame_not_ready");
