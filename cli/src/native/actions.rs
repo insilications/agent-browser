@@ -13091,7 +13091,11 @@ async fn wait_for_any_selector(
                 continue;
             };
             let mut ref_map = RefMap::new();
-            ref_map.add_exact_backend_node(AUTH_LOGIN_ELEMENT_REF.to_string(), backend_node_id);
+            ref_map.add_exact_backend_node(
+                AUTH_LOGIN_ELEMENT_REF.to_string(),
+                backend_node_id,
+                Some(session_id),
+            );
             return Ok(AuthLoginElement { ref_map });
         }
 

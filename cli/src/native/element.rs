@@ -95,7 +95,12 @@ impl RefMap {
     /// Add a ref that must keep resolving to this exact backend node. This is
     /// used for actions that select a concrete DOM node before interacting;
     /// falling back by role/name could silently target a different element.
-    pub fn add_exact_backend_node(&mut self, ref_id: String, backend_node_id: i64) {
+    pub fn add_exact_backend_node(
+        &mut self,
+        ref_id: String,
+        backend_node_id: i64,
+        session_id: Option<&str>,
+    ) {
         self.map.insert(
             ref_id,
             RefEntry {
@@ -106,6 +111,7 @@ impl RefMap {
                 selector: None,
                 frame_id: None,
                 allow_role_fallback: false,
+                session_id: session_id.map(String::from),
             },
         );
     }
